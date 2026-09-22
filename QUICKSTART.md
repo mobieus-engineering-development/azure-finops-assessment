@@ -1,6 +1,6 @@
 # Quick Start Guide - AZ Cost Assessment
 
-Get your Azure cost analysis running in **under 2 minutes**! No manual configuration needed.
+Run an interactive, read-only Azure cost assessment. Collection time depends on the reporting window, pagination and Azure throttling.
 
 ## Prerequisites
 
@@ -79,46 +79,18 @@ Starting cost analysis...
 
 After setup, the analyzer will:
 
-⏱️ **Takes about 2 minutes total**
+Queries are paced to reduce throttling; allow several minutes for collection.
 
 1. Query 30 days of historical costs
 2. Analyze trends and patterns
 3. Detect cost anomalies
-4. Generate 30-day forecasts
-5. Provide smart recommendations
+4. Reconcile daily, service and resource costs
+5. Disclose scope, currency and data limitations; forecasts and savings are unavailable
 6. Save reports to `reports/` folder
 
-## Output Example
+## Output
 
-```
-============================================================
-AZURE COST ANALYZER REPORT
-============================================================
-
-📊 COST SUMMARY
-------------------------------------------------------------
-Subscription: Production Subscription
-Historical Total (30 days): $9,425.98 USD
-Current Month to Date: $972.25 USD
-Estimated Month End: $2,739.99 USD
-Average Daily Spend: $101.94 USD
-
-💰 TOP EXPENSIVE SERVICES
-------------------------------------------------------------
-1. Virtual Machines          $3,338.83 (35.4%)
-2. Storage                   $3,176.35 (33.7%)
-3. Microsoft Defender        $895.67 (9.5%)
-
-💡 RECOMMENDATIONS
-------------------------------------------------------------
-1. 🖥️ Optimize Virtual Machines (35.4% of costs)
-   Consider Reserved Instances...
-   💰 Potential Savings: ~$667.77 USD/30 days
-============================================================
-✓ JSON report saved to: reports/cost-analysis-2025-11-16.json
-✓ HTML report saved to:  reports/cost-analysis-2025-11-16.html
-============================================================
-```
+Local JSON and HTML reports contain observed ActualCost, completed UTC reporting dates, the returned currency and source limitations. Forecasts and savings estimates are unavailable. Invalid or inconsistent billing results stop report generation. See the [financial contract](docs/trustworthy-numbers.md) for supported comparisons and current limitations.
 
 ## Running Again
 

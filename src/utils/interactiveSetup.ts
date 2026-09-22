@@ -14,6 +14,7 @@ interface AzureAccount {
 }
 
 export class InteractiveSetup {
+    public close(): void { this.rl.close(); }
     private rl: readline.Interface;
 
     constructor() {
@@ -118,6 +119,10 @@ export class InteractiveSetup {
         }
 
         const tokenTenant = await this.getAzureCliAccessTokenTenant();
+        if (!tokenTenant) {
+            console.log('Unable to verify the Azure token tenant. Refresh the CLI sign-in before reporting.');
+            return null;
+        }
         if (tokenTenant && tokenTenant.toLowerCase() !== selected.tenantId.toLowerCase()) {
             console.log('❌ Azure CLI token tenant does not match selected subscription tenant.');
             console.log(`   Token tenant: ${tokenTenant}`);

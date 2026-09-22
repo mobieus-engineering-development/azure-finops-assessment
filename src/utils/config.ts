@@ -68,7 +68,7 @@ class ConfigService {
      */
     public reload(): void {
         // Reload dotenv to pick up new values
-        require('dotenv').config({ override: true });
+        require('dotenv').config({ override: false });
         this.appConfig = this.loadConfig();
     }
 
@@ -111,7 +111,7 @@ class ConfigService {
                     liveDataOnly: process.env.AZURE_COST_LIVE_DATA_ONLY
                         ? process.env.AZURE_COST_LIVE_DATA_ONLY.toLowerCase() === 'true'
                         : (cfg.azure?.costManagement?.liveDataOnly ?? true),
-                    apiDelayMs: parseInt(process.env.AZURE_COST_API_DELAY_MS || String(cfg.azure?.costManagement?.apiDelayMs || 5000), 10),
+                    apiDelayMs: parseInt(process.env.AZURE_COST_API_DELAY_MS || String(cfg.azure?.costManagement?.apiDelayMs || 16000), 10),
                     maxRetries: parseInt(process.env.AZURE_COST_MAX_RETRIES || String(cfg.azure?.costManagement?.maxRetries || 5), 10),
                     retryBaseDelayMs: parseInt(process.env.AZURE_COST_RETRY_BASE_DELAY_MS || String(cfg.azure?.costManagement?.retryBaseDelayMs || 15000), 10),
                     retryMaxDelayMs: parseInt(process.env.AZURE_COST_RETRY_MAX_DELAY_MS || String(cfg.azure?.costManagement?.retryMaxDelayMs || 120000), 10),
