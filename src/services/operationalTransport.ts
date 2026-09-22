@@ -4,7 +4,13 @@ import { retryAfterMs } from './costQuery';
 export type EvidenceGet = (url: string) => Promise<unknown>;
 
 /** Resource IDs are joined case-insensitively, without rewriting encoded path segments. */
-export function normalizeResourceId(value: string): string { return value.trim().replace(/\/+$/, '').toLowerCase(); }
+export function normalizeResourceId(value: string): string {
+    const trimmed = value.trim();
+    let end = trimmed.length;
+    // A backward scan is linear even for long, slash-heavy provider input.
+    while (end > 0 && trimmed.charCodeAt(end - 1) === 47) end--;
+    return trimmed.slice(0, end).toLowerCase();
+}
 
 export function resourceInScope(id: string, scope: string): boolean {
     return normalizeResourceId(id).startsWith(`${normalizeResourceId(scope)}/`) && !/[?#\\\x00-\x1f\x7f]/.test(id) && !/%2[fFeE]|%5[cC]/.test(id) &&

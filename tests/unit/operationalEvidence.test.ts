@@ -1,7 +1,7 @@
 import { AzureCliCredential } from '@azure/identity';
 import { configService } from '../../src/utils/config';
 import { OperationalEvidenceService } from '../../src/services/operationalEvidenceService';
-import { azureEvidenceGet, EvidenceGet } from '../../src/services/operationalTransport';
+import { azureEvidenceGet, EvidenceGet, normalizeResourceId } from '../../src/services/operationalTransport';
 import { buildMonthlyReport } from '../../src/services/monthlyReport';
 import { monthlyCsvFiles, monthlyHtml } from '../../src/services/monthlyReportWriter';
 import { MonthlyCostEvidence } from '../../src/models/monthlyReport';
@@ -36,6 +36,13 @@ const get: EvidenceGet = async url => {
 beforeEach(() => jest.spyOn(configService, 'getAzureConfig').mockReturnValue({ subscriptionId: 'test-subscription', tenantId: 'test-tenant', scope,
     costManagement: { liveDataOnly: true, apiDelayMs: 0, maxRetries: 1, retryBaseDelayMs: 0, retryMaxDelayMs: 10 } }));
 afterEach(() => jest.restoreAllMocks());
+
+test('resource ID normalization handles long slash sequences without backtracking', () => {
+    expect(normalizeResourceId(`  ${vm.toUpperCase()}${'/'.repeat(100000)}  `)).toBe(vm.toLowerCase());
+    const interior = `${scope}/${'/'.repeat(100000)}Resource`;
+    expect(normalizeResourceId(interior)).toBe(interior.toLowerCase());
+    expect(normalizeResourceId('////')).toBe('');
+});
 
 test('joins case-insensitively without losing credits or historical charges; excludes unmatched/old Advisor candidates', async () => {
     const ops = await new OperationalEvidenceService(get, clock).collect(financial());
