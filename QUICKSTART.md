@@ -4,7 +4,7 @@ Run an interactive, read-only Azure cost assessment. Collection time depends on 
 
 ## Prerequisites
 
-- **Node.js** ≥18.0.0 (LTS recommended — [nodejs.org](https://nodejs.org/))
+- **Node.js 24 LTS** recommended; Node 22 LTS also covered by CI ([nodejs.org](https://nodejs.org/))
 - **Azure CLI** (latest) — [Install guide](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 - An **Azure subscription** with the **Cost Management Reader** and **Reader** roles assigned to your account
 
@@ -15,8 +15,8 @@ That's it! The tool will guide you through the rest interactively.
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/mobieus10036/az-cost-assessment.git
-cd az-cost-assessment
+git clone https://github.com/mobieus-engineering-development/azure-finops-assessment.git
+cd azure-finops-assessment
 npm install
 ```
 

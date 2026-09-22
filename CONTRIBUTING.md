@@ -16,7 +16,7 @@ Thank you for helping improve this project.
    - `npm run typecheck`
    - `npm run build`
    - `npm test`
-4. Sign your commits with GPG (`git commit -S -m "your message"`) — unsigned commits are blocked by CI
+4. Configure a GitHub-registered signing key, then sign your commits (`git commit -S -m "your message"`). CI requires GitHub to verify each signature.
 5. Open a pull request using the provided template
 
 ## Commit and branch policy
@@ -24,7 +24,7 @@ Thank you for helping improve this project.
 - Pull requests to `main` are required
 - Signed commits are required for merges
 - At least one approving review is required
-- Required checks include CI, commit signature validation, and CodeQL
+- Required branch-protection checks currently include both legacy build jobs, security and commit signature validation. CodeQL also runs; see [the housekeeping plan](docs/repository-health.md) for the supported-Node check migration.
 
 ## Coding expectations
 
