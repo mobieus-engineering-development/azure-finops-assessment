@@ -31,6 +31,21 @@ Select the subscription and historical window at the prompts. `.env` is optional
 
 Reports are saved under `reports/`, which is excluded from Git. They contain private financial/resource data and should be reviewed before sharing. Tokens are not stored in reports. Do not commit `.env` or generated reports.
 
+## Monthly reporting product
+
+Generate a review pack for the last closed UTC calendar month, or select a month explicitly:
+
+```powershell
+npm start -- --monthly
+npm start -- --monthly 2026-08
+```
+
+Select the subscription at startup. The monthly mode queries the selected month and the prior full month; it does not ask for a rolling lookback. Open `index.html` in the newly printed `reports/monthly-.../` folder. Each run creates a separate snapshot.
+
+The pack includes an executive readout, month-over-month cost changes, service and resource-group drivers, daily spend, missing billing dates and investigation questions. JSON evidence and four CSV files accompany the offline HTML. Keep the folder together when sharing; browser Print → Save as PDF creates a meeting copy.
+
+See [monthly reporting](docs/monthly-reporting.md) for definitions, evidence boundaries and workflow. This mode works on the first UTC day of a month because it only uses closed months.
+
 ## Configuration
 
 Defaults are in `config/default.json`; examples are in `.env.example`.
@@ -50,7 +65,7 @@ AZURE_COST_RETRY_MAX_DELAY_MS=120000
 
 - Results spanning multiple currencies are rejected rather than summed. Currency-separated tenant aggregation is future work.
 - A required period with no billing rows is unknown, not verified zero; it stops this version of the report. Explicit zero-valued rows are supported.
-- The first UTC day of the month has no completed MTD day, so the report cannot yet run then. Partial-result reporting is a follow-up.
+- The rolling assessment cannot run on the first UTC day of a month because no completed MTD day exists. Monthly mode supports that date; partial-result reporting remains a follow-up.
 - Inventory enrichment, Advisor opportunities, utilization and savings verification are not included in the active report.
 - API data can arrive late or be rerated. Successful pagination and reconciliation do not establish billing freshness.
 

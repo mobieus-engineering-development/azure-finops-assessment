@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — monthly reporting
+
+- Closed-calendar-month review packs via `npm start -- --monthly [YYYY-MM]`, defaulting to the previous month.
+- Executive observations, reconciled service/resource-group changes, daily spend and explicit observed-date coverage.
+- Offline HTML with print styling, complete JSON evidence and signed daily/service/resource-group/resource CSV exports.
+- Separate snapshot folders, spreadsheet formula protection for text fields and incomplete-export detection.
+
 ### Changed — trustworthy numbers
 
 - Read-only ActualCost reporting with complete pagination, signed costs, currency validation, resource/group breakdowns and reconciled totals.
