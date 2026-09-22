@@ -1,4 +1,5 @@
 import { HistoricalCostData } from './costAnalysis';
+import { OperationalEvidence } from './operationalEvidence';
 
 export interface MonthlyCostEvidence {
     month: string;
@@ -28,7 +29,8 @@ export interface MonthCoverage {
 }
 
 export interface MonthlyReport {
-    schemaVersion: '1.0';
+    schemaVersion: '1.0' | '1.1';
+    operationalEvidence?: OperationalEvidence;
     evidence: MonthlyCostEvidence;
     change: { amount: number; percent: number | null };
     coverage: { current: MonthCoverage; previous: MonthCoverage };

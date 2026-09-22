@@ -11,16 +11,29 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { buildMonthlyReport, closedMonthWindow } from './services/monthlyReport';
 import { writeMonthlyReport } from './services/monthlyReportWriter';
+import { OperationalEvidenceService } from './services/operationalEvidenceService';
 
 /** Financial reporting only. No recommendation execution or cloud storage writes. */
 export class FinOpsAssessmentApp {
-    constructor(private readonly costService = new AzureCostManagementService()) {}
+    constructor(private readonly costService = new AzureCostManagementService(), private readonly operationalService = () => new OperationalEvidenceService()) {}
 
-    public async runMonthly(month?: string): Promise<void> {
+    public async runMonthly(month?: string, withOperations = false): Promise<void> {
         const report = buildMonthlyReport(await this.costService.getMonthlyCostEvidence(month));
+        if (withOperations) {
+            console.log('Collecting current inventory, cached Advisor findings and selected-month VM CPU evidence (read only)...');
+            report.operationalEvidence = await this.operationalService().collect(report.evidence);
+            report.schemaVersion = '1.1';
+            report.limitations = report.limitations.map(value => value.startsWith('Budget, forecast, accountable owners') ?
+                'Budget, forecast, verified ownership, validated optimization opportunities and realized savings are not assessed. Optional operational evidence has its own coverage and limitations.' : value);
+        }
         const directory = writeMonthlyReport(report);
         console.log(`\nMONTHLY FINOPS REVIEW — ${report.evidence.month} — READ ONLY`);
         for (const observation of report.observations) console.log(observation);
+        if (report.operationalEvidence) {
+            const { inventory, advisor, resources } = report.operationalEvidence;
+            console.log(`Operational coverage: inventory ${inventory.status}; Advisor ${advisor.status}; ${resources.filter(r => r.cpu.status === 'observed').length} resources with CPU observations.`);
+            console.log(`Advisor review candidates: ${advisor.recommendations.filter(r => r.reviewEligible).length}; no combined savings estimate.`);
+        }
         console.log('Single subscription; provisional ActualCost. Budget, forecast and savings are not assessed.');
         console.log(`Report pack saved: ${directory}`);
     }
@@ -70,11 +83,13 @@ export class FinOpsAssessmentApp {
     }
 }
 
-export function parseReportArguments(args: string[]): { monthly: boolean; month?: string } {
+export function parseReportArguments(args: string[]): { monthly: boolean; month?: string; withOperations?: boolean } {
     if (!args.length) return { monthly: false };
-    if (args[0] !== '--monthly' || args.length > 2) throw new Error('Usage: npm start -- [--monthly [YYYY-MM]]');
-    const month = closedMonthWindow(args[1], new Date()).month;
-    return { monthly: true, month };
+    const withOperations = args.includes('--with-operations');
+    const monthlyArgs = args.filter(arg => arg !== '--with-operations');
+    if (args.filter(arg => arg === '--with-operations').length > 1 || monthlyArgs[0] !== '--monthly' || monthlyArgs.length > 2) throw new Error('Usage: npm start -- --monthly [YYYY-MM] [--with-operations]');
+    const month = closedMonthWindow(monthlyArgs[1], new Date()).month;
+    return { monthly: true, month, ...(withOperations ? { withOperations: true } : {}) };
 }
 
 async function main(): Promise<void> {
@@ -91,7 +106,7 @@ async function main(): Promise<void> {
         await setup.maybePersistDefaultSubscription(context);
         configService.reload();
         const app = new FinOpsAssessmentApp();
-        if (options.monthly) await app.runMonthly(options.month);
+        if (options.monthly) await app.runMonthly(options.month, options.withOperations);
         else await app.run();
     } finally { setup.close(); }
 }

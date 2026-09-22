@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { MonthlyDriver, MonthlyReport } from '../models/monthlyReport';
+import { operationalCsvRows, operationalHtml } from './operationalReport';
 
 const escape = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const percent = (value: number | null) => value === null ? 'Unavailable' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
@@ -21,6 +22,7 @@ export function monthlyCsvFiles(report: MonthlyReport): Record<string, string> {
         ...rows.map(r => [r.name, evidence.previous.startDate.slice(0, 7), evidence.month, currency, r.previousCost, r.currentCost, r.change, r.changePercent, r.presence])
     ]);
     return {
+        ...(report.operationalEvidence ? Object.fromEntries(Object.entries(operationalCsvRows(report.operationalEvidence)).map(([name, rows]) => [name, csv(rows)])) : {}),
         'services.csv': driverCsv(drivers.services),
         'resource-groups.csv': driverCsv(drivers.resourceGroups),
         'resources.csv': csv([['month', 'resource_id', 'resource_name', 'resource_group', 'currency', 'cost'],
@@ -61,6 +63,7 @@ export function monthlyHtml(report: MonthlyReport): string {
 <section class="notice"><h2>Coverage and confidence in the data</h2><p>All ${evidence.collectedPages} returned pages collected. Daily, service and resource totals reconciled within 0.01 ${currency} per month. This establishes internal consistency, not final billing accuracy.</p><div class="scroll"><table><caption>UTC calendar coverage and observed-day averages</caption><thead><tr><th>Month</th><th>Cost</th><th>Observed / calendar days</th><th>Average / observed day</th><th>Dates not returned</th></tr></thead><tbody>${periodRows}</tbody></table></div></section>
 ${driverTable(drivers.services, 'Service cost drivers', 'services.csv')}${driverTable(drivers.resourceGroups, 'Resource-group cost drivers', 'resource-groups.csv')}
 <section><h2>Daily spend in the selected month</h2><p>Bar length shows absolute cost. Purple bars indicate negative adjustments. Missing dates remain unknown. <a href="daily.csv" download>Download both months</a></p><table class="daily"><caption>Signed daily cost, UTC</caption><thead><tr><th>Date</th><th>Cost</th><th>Magnitude</th></tr></thead><tbody>${days.join('')}</tbody></table></section>
+${report.operationalEvidence ? operationalHtml(report.operationalEvidence) : ''}
 <section><h2>Questions for the monthly review</h2><p>Investigation prompts, not confirmed causes or optimization recommendations.</p>${list(report.reviewQuestions)}</section>
 <section><h2>Evidence and limitations</h2>${list(report.limitations)}<nav class="downloads" aria-label="Report downloads"><a href="report.json" download>Full JSON evidence</a><a href="resources.csv" download>Resource detail — both months</a><a href="services.csv" download>Services CSV</a><a href="resource-groups.csv" download>Resource groups CSV</a></nav><p>Keep this folder together when sharing. Use your browser’s Print → Save as PDF for a meeting copy.</p></section>
 <footer>Schema ${report.schemaVersion} · Financial/resource data: review recipients before sharing. Reruns collect a new snapshot and may differ after billing updates.</footer></main></body></html>`;
