@@ -23,7 +23,7 @@ export interface ServiceCostDelta {
     previousCost: number;
     currentCost: number;
     changeAmount: number;
-    changePercent: number;
+    changePercent: number | null;
     currency: string;
 }
 
@@ -33,13 +33,18 @@ export interface DailyCostFluctuation {
     totalCost: number;
     previousTotalCost: number;
     totalChangeAmount: number;
-    totalChangePercent: number;
+    totalChangePercent: number | null;
     direction: 'increasing' | 'decreasing' | 'stable';
     significance: 'low' | 'medium' | 'high' | 'critical';
     topServiceDrivers: ServiceCostDelta[];
 }
 
 export interface DataProvenance {
+    costBasis?: 'ActualCost';
+    coverage?: string;
+    queriedThrough?: string;
+    collectedPages?: number;
+    notices?: string[];
     mode: 'live' | 'fallback';
     source: string;
     generatedFromFallback: boolean;
@@ -67,7 +72,7 @@ export interface CostByService {
     serviceCategory: string;
     cost: number;
     currency: string;
-    percentageOfTotal: number;
+    percentageOfTotal: number | null;
 }
 
 export interface HistoricalCostData {
@@ -92,15 +97,18 @@ export interface CurrentCostData {
     billingPeriodEnd: string;
     currentDate: string;
     monthToDateCost: number;
-    estimatedMonthEndCost: number;
+    estimatedMonthEndCost: number | null;
     currency: string;
     dailyCosts: CostDataPoint[];
     topCostResources: CostByResource[];
     topCostServices: CostByService[];
     comparisonToPreviousMonth: {
+        comparableDays?: number;
+        previousComparableCost?: number;
+        currentComparableCost?: number;
         previousMonthTotal: number;
         changeAmount: number;
-        changePercent: number;
+        changePercent: number | null;
     };
     monthlyComparison: {
         twoMonthsAgo: {
@@ -114,15 +122,15 @@ export interface CurrentCostData {
         currentMonth: {
             name: string;  // e.g., "November 2025"
             monthToDate: number;
-            projected: number;
+            projected: number | null;
         };
         lastTwoMonthsChange: {
             amount: number;
-            percent: number;
+            percent: number | null;
         };
         projectedChange: {
-            amount: number;
-            percent: number;
+            amount: number | null;
+            percent: number | null;
         };
     };
 }
@@ -138,12 +146,12 @@ export interface ForecastDataPoint {
 export interface ForecastedCostData {
     forecastStartDate: string;
     forecastEndDate: string;
-    totalForecastedCost: number;
+    totalForecastedCost: number | null;
     currency: string;
     dailyForecasts: ForecastDataPoint[];
     monthlyForecasts: ForecastDataPoint[];
     forecastMethod: string; // e.g., 'linear', 'exponential', 'azure-api'
-    confidenceLevel: number; // e.g., 0.95 for 95% confidence
+    confidenceLevel: number | null; // Null when no validated forecast exists.
     assumptions: string[];
 }
 
@@ -173,7 +181,7 @@ export interface CostTrend {
         type: 'moving_average' | 'week_over_week' | 'seasonality' | 'projection';
         description: string;
         value: number;
-        confidence: 'low' | 'medium' | 'high';
+        confidence?: 'low' | 'medium' | 'high';
     }>;
     movingAverages?: {
         sevenDay?: number;
@@ -198,8 +206,8 @@ export interface ComprehensiveCostAnalysis {
     summary: {
         totalHistoricalCost: number;
         currentMonthToDate: number;
-        forecastedMonthEnd: number;
-        forecastedNextMonth: number;
+        forecastedMonthEnd: number | null;
+        forecastedNextMonth: number | null;
         currency: string;
         avgDailySpend: number;
         peakDailySpend: number;

@@ -1,682 +1,104 @@
-/**
- * Azure FinOps Assessment PoC - Main Application
- * 
- * This application provides comprehensive cost analysis for Azure subscriptions,
- * including historical trends, current spending, and forecasted costs.
- */
-
 import { AzureCostManagementService } from './services/azureCostManagementService';
-import { AzureResourceService } from './services/azureResourceService';
 import { CostTrendAnalyzer } from './analyzers/costTrendAnalyzer';
 import { AnomalyDetector } from './analyzers/anomalyDetector';
 import { DailyCostFluctuationAnalyzer } from './analyzers/dailyCostFluctuationAnalyzer';
-import { SmartRecommendationAnalyzer } from './analyzers/smartRecommendationAnalyzer';
-import { VMCostAnalyzer } from './analyzers/vmCostAnalyzer';
 import { HtmlReportGenerator } from './services/htmlReportGenerator';
-import { VMCostSummary } from './models/vmCostAnalysis';
-import { ComprehensiveCostAnalysis, DailyCostFluctuation } from './models/costAnalysis';
-import { logInfo, logError } from './utils/logger';
+import { ComprehensiveCostAnalysis } from './models/costAnalysis';
 import { configService } from './utils/config';
 import { InteractiveSetup } from './utils/interactiveSetup';
-import { format } from 'date-fns';
+import { formatCurrency, formatPercentChange } from './utils/colors';
 import * as fs from 'fs';
 import * as path from 'path';
-import { colors, getSeverityColor, getTrendColor, getChangeColor, formatCurrency, formatPercentChange } from './utils/colors';
+import { buildMonthlyReport, closedMonthWindow } from './services/monthlyReport';
+import { writeMonthlyReport } from './services/monthlyReportWriter';
 
-class FinOpsAssessmentApp {
-    private costService: AzureCostManagementService;
-    private resourceService: AzureResourceService;
-    private trendAnalyzer: CostTrendAnalyzer;
-    private anomalyDetector: AnomalyDetector;
-    private dailyFluctuationAnalyzer: DailyCostFluctuationAnalyzer;
-    private smartRecommendations: SmartRecommendationAnalyzer;
-    private vmCostAnalyzer: VMCostAnalyzer;
-    private htmlGenerator: HtmlReportGenerator;
+/** Financial reporting only. No recommendation execution or cloud storage writes. */
+export class FinOpsAssessmentApp {
+    constructor(private readonly costService = new AzureCostManagementService()) {}
 
-    constructor() {
-        logInfo('='.repeat(60));
-        logInfo('Azure FinOps Assessment PoC');
-        logInfo('='.repeat(60));
-
-        // Initialize services
-        this.costService = new AzureCostManagementService();
-        this.resourceService = new AzureResourceService();
-        this.trendAnalyzer = new CostTrendAnalyzer();
-        this.anomalyDetector = new AnomalyDetector();
-        this.dailyFluctuationAnalyzer = new DailyCostFluctuationAnalyzer();
-        this.smartRecommendations = new SmartRecommendationAnalyzer();
-        this.vmCostAnalyzer = new VMCostAnalyzer();
-        this.htmlGenerator = new HtmlReportGenerator();
-
-        logInfo('All services initialized successfully');
+    public async runMonthly(month?: string): Promise<void> {
+        const report = buildMonthlyReport(await this.costService.getMonthlyCostEvidence(month));
+        const directory = writeMonthlyReport(report);
+        console.log(`\nMONTHLY FINOPS REVIEW — ${report.evidence.month} — READ ONLY`);
+        for (const observation of report.observations) console.log(observation);
+        console.log('Single subscription; provisional ActualCost. Budget, forecast and savings are not assessed.');
+        console.log(`Report pack saved: ${directory}`);
     }
 
-    /**
-     * Run the complete FinOps assessment
-     */
     public async run(): Promise<void> {
+        const analysis = await this.costService.getComprehensiveCostAnalysis();
+        analysis.trends = new CostTrendAnalyzer().analyzeTrends(analysis);
+        analysis.anomalies = new AnomalyDetector().detectAnomalies(analysis);
+        analysis.fluctuations = new DailyCostFluctuationAnalyzer().analyzeFluctuations(analysis);
+        // Legacy VM/disk heuristics are intentionally not run: they fabricate prices,
+        // equate charge-bearing days with utilization, and double-count alternatives.
+        this.saveResults(analysis);
+        this.displayReport(analysis);
+    }
+
+    private displayReport(analysis: ComprehensiveCostAnalysis): void {
+        const { summary, historical, current, dataProvenance } = analysis;
+        console.log('\nAZURE FINOPS COST REPORT — READ ONLY');
+        console.log(dataProvenance.coverage);
+        console.log(`Basis: ${dataProvenance.costBasis}; through ${dataProvenance.queriedThrough} (UTC)`);
+        console.log(`Historical period: ${historical.startDate} — ${historical.endDate}`);
+        console.log(`Historical total: ${formatCurrency(summary.totalHistoricalCost, summary.currency)}`);
+        console.log(`MTD (excluding today): ${formatCurrency(summary.currentMonthToDate, summary.currency)}`);
+        console.log(`Average per observed day: ${formatCurrency(summary.avgDailySpend, summary.currency)}`);
+        console.log(`Closed-month change: ${formatPercentChange(current.monthlyComparison.lastTwoMonthsChange.percent)}`);
+        const comparison = current.comparisonToPreviousMonth;
+        console.log(`First ${comparison.comparableDays} days versus previous month: ${formatPercentChange(comparison.changePercent)}`);
+        console.log('Forecast and potential savings: unavailable (not calculated).');
+        console.log('\nCost by service:');
+        for (const service of historical.costByService) console.log(`  ${service.serviceName}: ${formatCurrency(service.cost, service.currency)}`);
+        for (const notice of dataProvenance.notices || []) console.log(`Note: ${notice}`);
+        console.log('JSON and HTML reports saved locally in reports/.');
+    }
+
+    private saveResults(analysis: ComprehensiveCostAnalysis): void {
+        const directory = path.join(process.cwd(), 'reports');
+        fs.mkdirSync(directory, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const base = path.join(directory, `finops-assessment-${stamp}`);
+        const html = new HtmlReportGenerator().generate(analysis);
         try {
-            logInfo('Starting FinOps assessment...\n');
-
-            // Step 1: Gather comprehensive cost analysis
-            logInfo('Step 1: Gathering cost data...');
-            const costAnalysis = await this.costService.getComprehensiveCostAnalysis();
-            logInfo(`[OK] Cost analysis complete\n`);
-
-            // Step 2: Analyze cost trends
-            logInfo('Step 2: Analyzing cost trends...');
-            costAnalysis.trends = this.trendAnalyzer.analyzeTrends(costAnalysis);
-            logInfo(`[OK] Identified ${costAnalysis.trends.length} trends\n`);
-
-            // Step 3: Detect cost anomalies
-            logInfo('Step 3: Detecting cost anomalies...');
-            costAnalysis.anomalies = this.anomalyDetector.detectAnomalies(costAnalysis);
-            logInfo(`[OK] Detected ${costAnalysis.anomalies.length} anomalies\n`);
-
-            // Step 4: Attribute daily cost fluctuations to services
-            logInfo('Step 4: Analyzing daily cost fluctuations...');
-            costAnalysis.fluctuations = this.dailyFluctuationAnalyzer.analyzeFluctuations(costAnalysis);
-            logInfo(`[OK] Identified ${costAnalysis.fluctuations.length} significant daily fluctuations\n`);
-
-            // Step 5: Generate smart recommendations
-            logInfo('Step 5: Generating smart recommendations...');
-            const recommendations = await this.smartRecommendations.analyze();
-            const recommendationSummary = this.smartRecommendations.generateSummary(recommendations);
-            logInfo(`[OK] Generated ${recommendations.length} recommendations (potential savings: $${recommendationSummary.totalPotentialMonthlySavings.toFixed(2)}/month)\n`);
-
-            // Step 6: Analyze VM costs
-            logInfo('Step 6: Analyzing per-VM costs...');
-            let vmCostSummary: VMCostSummary | undefined;
-            try {
-                vmCostSummary = await this.vmCostAnalyzer.analyzeVMCosts(90);
-                logInfo(`[OK] Analyzed costs for ${vmCostSummary.topCostVMs.length} VMs (total: $${vmCostSummary.totalVMCost.toFixed(2)}, potential savings: $${vmCostSummary.totalPotentialSavings.toFixed(2)}/month)\n`);
-            } catch (error) {
-                logInfo(`[WARN] VM cost analysis skipped: ${error}\n`);
-            }
-
-            // Step 7: Generate and display report
-            logInfo('Step 7: Generating assessment report...\n');
-            this.displayReport(costAnalysis, recommendationSummary, vmCostSummary);
-            
-            // Step 8: Save results to file
-            await this.saveResults(costAnalysis, recommendations, recommendationSummary, vmCostSummary);
-
-            logInfo('\n' + '='.repeat(60));
-            logInfo('FinOps assessment completed successfully!');
-            logInfo('='.repeat(60));
-
-        } catch (error) {
-            logError(`Fatal error during assessment: ${error}`);
-            throw error;
-        }
-    }
-
-    /**
-     * Display assessment report to console
-     */
-    private displayReport(costAnalysis: ComprehensiveCostAnalysis, recommendationSummary?: any, vmCostSummary?: VMCostSummary): void {
-        console.log('\n' + colors.separator('='.repeat(60)));
-        console.log(colors.header('AZURE FINOPS ASSESSMENT REPORT'));
-        console.log(colors.separator('='.repeat(60)));
-        
-        // Summary Section
-        console.log('\n' + colors.subheader('COST SUMMARY'));
-        console.log(colors.separator('-'.repeat(60)));
-        console.log(colors.label('Subscription ID: ') + colors.dim(costAnalysis.subscriptionId));
-        console.log(colors.label('Analysis Date:   ') + colors.dim(new Date(costAnalysis.analysisDate).toLocaleString()));
-        console.log(colors.label('Currency:        ') + colors.info(costAnalysis.summary.currency));
-        console.log('');
-        console.log(colors.label(`Historical Total (${costAnalysis.historical.startDate.split('T')[0]} to ${costAnalysis.historical.endDate.split('T')[0]}):`));
-        console.log(`  ${formatCurrency(costAnalysis.summary.totalHistoricalCost, costAnalysis.summary.currency)}`);
-        console.log('');
-        console.log(colors.label(`Current Month to Date:`));
-        console.log(`  ${formatCurrency(costAnalysis.summary.currentMonthToDate, costAnalysis.summary.currency)}`);
-        console.log('');
-        console.log(colors.label(`Estimated Month End:`));
-        console.log(`  ${formatCurrency(costAnalysis.summary.forecastedMonthEnd, costAnalysis.summary.currency)}`);
-        console.log('');
-        console.log(colors.label(`Forecasted Next Period:`));
-        console.log(`  ${formatCurrency(costAnalysis.summary.forecastedNextMonth, costAnalysis.summary.currency)}`);
-        console.log('');
-        console.log(colors.label('Average Daily Spend: ') + formatCurrency(costAnalysis.summary.avgDailySpend, costAnalysis.summary.currency));
-        console.log(colors.label('Peak Daily Spend:    ') + formatCurrency(costAnalysis.summary.peakDailySpend, costAnalysis.summary.currency));
-
-        // Daily Spend for Past 14 Days
-        console.log('\n' + colors.subheader('DAILY SPEND (PAST 14 DAYS)'));
-        console.log(colors.separator('-'.repeat(60)));
-        
-        if (costAnalysis.historical.dailyCosts && costAnalysis.historical.dailyCosts.length > 0) {
-            // Get the last 14 days of daily costs
-            const recentDailyCosts = costAnalysis.historical.dailyCosts.slice(-14);
-            
-            recentDailyCosts.forEach((dayData: any) => {
-                const date = new Date(dayData.date);
-                const dateStr = format(date, 'MMM dd, yyyy (EEE)');
-                const cost = dayData.cost.toFixed(2);
-                const padding = ' '.repeat(Math.max(0, 25 - dateStr.length));
-                
-                console.log(`${colors.dim(dateStr)}${padding}${colors.value('$' + cost.padStart(8))}`);
-            });
-            
-            // Calculate 14-day average
-            const fourteenDayTotal = recentDailyCosts.reduce((sum: number, d: any) => sum + d.cost, 0);
-            const fourteenDayAvg = fourteenDayTotal / recentDailyCosts.length;
-            console.log(colors.separator('-'.repeat(60)));
-            console.log(colors.label('14-Day Average: ') + formatCurrency(fourteenDayAvg, costAnalysis.summary.currency) + colors.label('/day'));
-        } else {
-            console.log(colors.dim('No daily cost data available'));
-        }
-
-        this.displayDailyFluctuations(costAnalysis.fluctuations, costAnalysis.summary.currency);
-
-        // Month-over-Month Comparison (3 months)
-        console.log('\n' + colors.subheader('MONTHLY COST COMPARISON'));
-        console.log(colors.separator('-'.repeat(60)));
-        
-        const monthlyComp = costAnalysis.current.monthlyComparison;
-        
-        // Show three months
-        console.log(`${colors.dim(monthlyComp.twoMonthsAgo.name.padEnd(20))} ${formatCurrency(monthlyComp.twoMonthsAgo.total, costAnalysis.summary.currency)}`);
-        console.log(`${colors.dim(monthlyComp.lastMonth.name.padEnd(20))} ${formatCurrency(monthlyComp.lastMonth.total, costAnalysis.summary.currency)}`);
-        console.log(`${colors.dim(monthlyComp.currentMonth.name.padEnd(20))} ${formatCurrency(monthlyComp.currentMonth.monthToDate, costAnalysis.summary.currency)} ${colors.label('(month-to-date)')}`);
-        console.log(`${' '.repeat(20)} ${formatCurrency(monthlyComp.currentMonth.projected, costAnalysis.summary.currency)} ${colors.label('(projected)')}`);
-        console.log('');
-        
-        // Show changes
-        const historicalSymbol = monthlyComp.lastTwoMonthsChange.percent > 0 ? '^' : monthlyComp.lastTwoMonthsChange.percent < 0 ? 'v' : '-';
-        const projectedSymbol = monthlyComp.projectedChange.percent > 0 ? '^' : monthlyComp.projectedChange.percent < 0 ? 'v' : '-';
-        
-        console.log(colors.label(`${monthlyComp.twoMonthsAgo.name} to ${monthlyComp.lastMonth.name}:`));
-        const historicalChange = `${historicalSymbol} ${monthlyComp.lastTwoMonthsChange.amount > 0 ? '+' : ''}${monthlyComp.lastTwoMonthsChange.amount.toFixed(2)} ${costAnalysis.summary.currency} (${formatPercentChange(monthlyComp.lastTwoMonthsChange.percent)})`;
-        console.log(`  ${getChangeColor(monthlyComp.lastTwoMonthsChange.percent)(historicalChange)}`);
-        console.log('');
-        console.log(colors.label(`${monthlyComp.lastMonth.name} to ${monthlyComp.currentMonth.name} (projected):`));
-        const projectedChange = `${projectedSymbol} ${monthlyComp.projectedChange.amount > 0 ? '+' : ''}${monthlyComp.projectedChange.amount.toFixed(2)} ${costAnalysis.summary.currency} (${formatPercentChange(monthlyComp.projectedChange.percent)})`;
-        console.log(`  ${getChangeColor(monthlyComp.projectedChange.percent)(projectedChange)}`);
-        // Trends
-        if (costAnalysis.trends.length > 0) {
-            console.log('\n' + colors.subheader('COST TRENDS & PATTERNS'));
-            console.log(colors.separator('-'.repeat(60)));
-            costAnalysis.trends.forEach((trend: any) => {
-                const trendSymbol = trend.direction === 'increasing' ? '^' : trend.direction === 'decreasing' ? 'v' : '-';
-                const trendColor = getTrendColor(trend.direction);
-                const trendText = `${trendSymbol} ${trend.period.toUpperCase()}: ${trend.direction} (${formatPercentChange(trend.changePercent)})`;
-                console.log(trendColor(trendText));
-                
-                // Show moving averages if available
-                if (trend.movingAverages) {
-                    if (trend.movingAverages.sevenDay) {
-                        console.log(colors.dim(`   7-day moving avg: $${trend.movingAverages.sevenDay.toFixed(2)}/day`));
-                    }
-                    if (trend.movingAverages.thirtyDay) {
-                        console.log(colors.dim(`   30-day moving avg: $${trend.movingAverages.thirtyDay.toFixed(2)}/day`));
-                    }
-                }
-                
-                // Show week-over-week change
-                if (trend.weekOverWeekChange !== undefined) {
-                    const wowSymbol = trend.weekOverWeekChange > 0 ? '^' : 'v';
-                    const wowText = `Week-over-week: ${wowSymbol} ${trend.weekOverWeekChange > 0 ? '+' : ''}${trend.weekOverWeekChange.toFixed(1)}%`;
-                    console.log(colors.dim(`   ${wowText}`));
-                }
-                
-                // Show projection if available
-                if (trend.projectedNextPeriod) {
-                    console.log(colors.dim(`   Projected next ${trend.period}: $${trend.projectedNextPeriod.toFixed(2)}`));
-                }
-                console.log('');
-            });
-        }
-
-        // Anomalies
-        if (costAnalysis.anomalies.length > 0) {
-            console.log('\n' + colors.subheader('COST ANOMALIES DETECTED'));
-            console.log(colors.separator('-'.repeat(60)));
-            
-            // Group by severity
-            const critical = costAnalysis.anomalies.filter((a: any) => a.severity === 'critical');
-            const high = costAnalysis.anomalies.filter((a: any) => a.severity === 'high');
-            const medium = costAnalysis.anomalies.filter((a: any) => a.severity === 'medium');
-            const low = costAnalysis.anomalies.filter((a: any) => a.severity === 'low');
-            
-            const summary = `Total: ${costAnalysis.anomalies.length} anomalies (${colors.critical(critical.length + ' critical')}, ${colors.high(high.length + ' high')}, ${colors.medium(medium.length + ' medium')}, ${colors.low(low.length + ' low')})`;
-            console.log(summary + '\n');
-            
-            costAnalysis.anomalies.slice(0, 5).forEach((anomaly: any) => {
-                const severityColor = getSeverityColor(anomaly.severity);
-                console.log(severityColor(`[${anomaly.severity.toUpperCase()}] ${anomaly.description}`));
-                console.log(colors.dim(`   Date: ${anomaly.detectedDate.split('T')[0]}`));
-                
-                if (anomaly.category) {
-                    console.log(colors.dim(`   Type: ${anomaly.category.replace('_', ' ')}`));
-                }
-                
-                if (anomaly.confidence) {
-                    console.log(colors.dim(`   Confidence: ${(anomaly.confidence * 100).toFixed(0)}%`));
-                }
-                
-                if (anomaly.recommendations && anomaly.recommendations.length > 0) {
-                    console.log(colors.info(`   Action: ${anomaly.recommendations[0]}`));
-                }
-                console.log('');
-            });
-            
-            if (costAnalysis.anomalies.length > 5) {
-                console.log(colors.dim(`   ... and ${costAnalysis.anomalies.length - 5} more anomalies\n`));
-            }
-        }
-
-        // Service Cost Breakdown
-        if (costAnalysis.historical.costByService && costAnalysis.historical.costByService.length > 0) {
-            console.log('\n' + colors.subheader('TOP EXPENSIVE SERVICES'));
-            console.log(colors.separator('-'.repeat(60)));
-            
-            // Sort services by cost (descending) and take top 10
-            const topServices = costAnalysis.historical.costByService
-                .sort((a: any, b: any) => b.cost - a.cost)
-                .slice(0, 10);
-            
-            topServices.forEach((service: any, index: number) => {
-                const padding = ' '.repeat(Math.max(0, 35 - service.serviceName.length));
-                const costStr = formatCurrency(service.cost, service.currency);
-                const pctStr = colors.dim(`(${service.percentageOfTotal.toFixed(1)}%)`);
-                console.log(`${colors.dim(index + 1 + '.')} ${colors.info(service.serviceName)}${padding}${costStr} ${pctStr}`);
-            });
-
-            // Show total by category
-            const categoryTotals = topServices.reduce((acc: any, service: any) => {
-                if (!acc[service.serviceCategory]) {
-                    acc[service.serviceCategory] = 0;
-                }
-                acc[service.serviceCategory] += service.cost;
-                return acc;
-            }, {});
-
-            console.log('\n' + colors.label('Cost by Category:'));
-            Object.entries(categoryTotals)
-                .sort(([, a]: any, [, b]: any) => b - a)
-                .forEach(([category, cost]: any) => {
-                    console.log(`  ${colors.dim('-')} ${colors.info(category)}: ${formatCurrency(cost, costAnalysis.summary.currency)}`);
-                });
-        }
-
-        // Smart Recommendations Section (if available)
-        if (recommendationSummary && recommendationSummary.totalRecommendations > 0) {
-            console.log('\n' + colors.subheader('SMART RECOMMENDATIONS'));
-            console.log(colors.separator('-'.repeat(60)));
-            console.log(colors.label('Total Recommendations: ') + colors.value(recommendationSummary.totalRecommendations.toString()));
-            console.log(colors.label('Potential Monthly Savings: ') + colors.savings(`$${recommendationSummary.totalPotentialMonthlySavings.toFixed(2)} USD`));
-            console.log(colors.label('Potential Annual Savings: ') + colors.savings(`$${recommendationSummary.totalPotentialAnnualSavings.toFixed(2)} USD`));
-            
-            // Display by category
-            if (recommendationSummary.byType && Object.keys(recommendationSummary.byType).length > 0) {
-                console.log('\n' + colors.label('By Type:'));
-                Object.entries(recommendationSummary.byType).forEach(([type, data]: any) => {
-                    console.log(`  ${colors.info(type)}: ${data.count} ${colors.savings(`(save $${data.savings.toFixed(2)}/month)`)}`);
-                });
-            }
-
-            // Display by priority
-            if (recommendationSummary.byPriority && Object.keys(recommendationSummary.byPriority).length > 0) {
-                console.log('\n' + colors.label('By Priority:'));
-                if (recommendationSummary.byPriority.critical) {
-                    console.log(`  ${colors.critical('Critical')}: ${recommendationSummary.byPriority.critical.count} ${colors.savings(`($${recommendationSummary.byPriority.critical.savings.toFixed(2)}/month)`)}`);
-                }
-                if (recommendationSummary.byPriority.high) {
-                    console.log(`  ${colors.high('High')}: ${recommendationSummary.byPriority.high.count} ${colors.savings(`($${recommendationSummary.byPriority.high.savings.toFixed(2)}/month)`)}`);
-                }
-                if (recommendationSummary.byPriority.medium) {
-                    console.log(`  ${colors.medium('Medium')}: ${recommendationSummary.byPriority.medium.count} ${colors.savings(`($${recommendationSummary.byPriority.medium.savings.toFixed(2)}/month)`)}`);
-                }
-                if (recommendationSummary.byPriority.low) {
-                    console.log(`  ${colors.low('Low')}: ${recommendationSummary.byPriority.low.count} ${colors.savings(`($${recommendationSummary.byPriority.low.savings.toFixed(2)}/month)`)}`);
-                }
-            }
-
-            // Display top 5 recommendations
-            if (recommendationSummary.topRecommendations && recommendationSummary.topRecommendations.length > 0) {
-                console.log('\n' + colors.label('TOP RECOMMENDATIONS:'));
-                const topRecs = recommendationSummary.topRecommendations.slice(0, 5);
-                topRecs.forEach((rec: any, index: number) => {
-                    const priorityColor = getSeverityColor(rec.priority);
-                    console.log(`\n${colors.dim((index + 1) + '.')} ${priorityColor(`[${rec.priority.toUpperCase()}]`)} ${colors.recommendation(rec.title)}`);
-                    console.log(colors.label('   Savings: ') + colors.savings(`$${rec.potentialMonthlySavings.toFixed(2)}/month ($${rec.potentialAnnualSavings.toFixed(2)}/year)`));
-                    console.log(colors.label('   Effort: ') + colors.dim(rec.effort));
-                    console.log(colors.dim(`   ${rec.action}`));
-                    if (rec.implementationSteps && rec.implementationSteps.length > 0) {
-                        console.log(colors.info(`   Quick Action: ${rec.implementationSteps[0]}`));
-                    }
-                });
-            }
-            console.log('');
-        }
-
-        // VM Cost Analysis Section (if available)
-        if (vmCostSummary && vmCostSummary.topCostVMs.length > 0) {
-            console.log('\n' + colors.subheader('VM COST ANALYSIS'));
-            console.log(colors.separator('-'.repeat(60)));
-            console.log(colors.label('Total VM Cost (90 days): ') + formatCurrency(vmCostSummary.totalVMCost, 'USD'));
-            console.log(colors.label('Average VM Cost:         ') + formatCurrency(vmCostSummary.averageVMCost, 'USD'));
-            console.log(colors.label('Potential Monthly Savings: ') + colors.savings(`$${vmCostSummary.totalPotentialSavings.toFixed(2)} USD`));
-            
-            console.log('\n' + colors.label('Cost Trends:'));
-            console.log(`  ${colors.high('Increasing:')} ${vmCostSummary.vmsByTrend.increasing} VMs`);
-            console.log(`  ${colors.success('Decreasing:')} ${vmCostSummary.vmsByTrend.decreasing} VMs`);
-            console.log(`  ${colors.dim('Stable:')} ${vmCostSummary.vmsByTrend.stable} VMs`);
-
-            // Show top 10 VMs by cost
-            console.log('\n' + colors.label('TOP VMs BY COST:'));
-            console.log(colors.separator('-'.repeat(100)));
-            console.log(
-                colors.dim('VM Name'.padEnd(30)) +
-                colors.dim('Resource Group'.padEnd(25)) +
-                colors.dim('Total Cost'.padEnd(15)) +
-                colors.dim('Avg/Day'.padEnd(12)) +
-                colors.dim('Active'.padEnd(10)) +
-                colors.dim('Trend')
-            );
-            console.log(colors.separator('-'.repeat(100)));
-
-            vmCostSummary.topCostVMs.slice(0, 10).forEach((vm) => {
-                const trendSymbol = vm.costTrend === 'increasing' ? '↗' : vm.costTrend === 'decreasing' ? '↘' : '→';
-                const trendColor = vm.costTrend === 'increasing' ? colors.high : vm.costTrend === 'decreasing' ? colors.success : colors.dim;
-                
-                console.log(
-                    colors.info(vm.vmName.padEnd(30).substring(0, 30)) +
-                    colors.dim(vm.resourceGroup.padEnd(25).substring(0, 25)) +
-                    colors.value(`$${vm.totalCost.toFixed(2)}`.padStart(12).padEnd(15)) +
-                    colors.dim(`$${vm.averageDailyCost.toFixed(2)}`.padStart(9).padEnd(12)) +
-                    colors.dim(`${vm.daysActive}/${vm.daysInPeriod}`.padEnd(10)) +
-                    trendColor(`${trendSymbol} ${vm.trendPercentage > 0 ? '+' : ''}${vm.trendPercentage.toFixed(1)}%`)
-                );
-            });
-
-            // Show monthly breakdown for top 3 VMs
-            if (vmCostSummary.topCostVMs.length > 0 && vmCostSummary.topCostVMs[0].monthlyCosts?.length > 0) {
-                console.log('\n' + colors.label('MONTHLY BREAKDOWN (Top 3 VMs):'));
-                const months = vmCostSummary.topCostVMs[0].monthlyCosts;
-                
-                // Header
-                let header = colors.dim('VM Name'.padEnd(25));
-                months.forEach(m => {
-                    header += colors.dim(m.monthName.padStart(12));
-                });
-                header += colors.dim('Projected'.padStart(12));
-                console.log(header);
-                console.log(colors.separator('-'.repeat(25 + (months.length + 1) * 12)));
-
-                vmCostSummary.topCostVMs.slice(0, 3).forEach((vm) => {
-                    let row = colors.info(vm.vmName.padEnd(25).substring(0, 25));
-                    vm.monthlyCosts.forEach(mc => {
-                        row += colors.value(`$${mc.totalCost.toFixed(0)}`.padStart(12));
-                    });
-                    row += colors.savings(`$${vm.projectedMonthlyCost.toFixed(0)}`.padStart(12));
-                    console.log(row);
-                });
-            }
-
-            // Show VM recommendations summary
-            if (Object.keys(vmCostSummary.recommendationsByType).length > 0) {
-                console.log('\n' + colors.label('VM RECOMMENDATIONS BY TYPE:'));
-                Object.entries(vmCostSummary.recommendationsByType).forEach(([type, count]) => {
-                    console.log(`  ${colors.info(type.padEnd(20))} ${colors.value(count.toString())} recommendations`);
-                });
-            }
-            console.log('');
-        }
-
-        // Recommendations Section
-        console.log('\n' + colors.subheader('RECOMMENDATIONS'));
-        console.log(colors.separator('-'.repeat(60)));
-        
-        const recommendations = this.generateRecommendations(costAnalysis);
-        recommendations.forEach((rec, index) => {
-            console.log(colors.recommendation(`${index + 1}. ${rec.title}`));
-            console.log(colors.dim(`   ${rec.description}`));
-            if (rec.potentialSavings) {
-                console.log(colors.savings(`   Potential Savings: ${rec.potentialSavings}`));
-            }
-            console.log('');
-        });
-
-        console.log('\n' + colors.separator('='.repeat(60)));
-    }
-
-    private displayDailyFluctuations(fluctuations: DailyCostFluctuation[], currency: string): void {
-        console.log('\n' + colors.subheader('DAILY FLUCTUATIONS WITH SERVICE DRIVERS'));
-        console.log(colors.separator('-'.repeat(60)));
-
-        if (!fluctuations || fluctuations.length === 0) {
-            console.log(colors.dim('No significant daily fluctuations found at current threshold.'));
-            return;
-        }
-
-        fluctuations.slice(0, 5).forEach((fluctuation, index) => {
-            const symbol = fluctuation.totalChangeAmount >= 0 ? '^' : 'v';
-            const changeLine = `${symbol} ${formatPercentChange(fluctuation.totalChangePercent)} (${formatCurrency(fluctuation.totalChangeAmount, currency)})`;
-            const changeColor = getChangeColor(fluctuation.totalChangePercent);
-
-            console.log(`${colors.label(`${index + 1}. ${fluctuation.previousDate.split('T')[0]} -> ${fluctuation.date.split('T')[0]}`)} ${changeColor(changeLine)}`);
-
-            if (fluctuation.topServiceDrivers.length === 0) {
-                console.log(colors.dim('   No service attribution data available for this day.'));
-                return;
-            }
-
-            fluctuation.topServiceDrivers.slice(0, 3).forEach(driver => {
-                const driverSymbol = driver.changeAmount >= 0 ? '+' : '-';
-                console.log(colors.dim(`   ${driverSymbol} ${driver.serviceName}: ${formatCurrency(Math.abs(driver.changeAmount), currency)} (${formatPercentChange(driver.changePercent)})`));
-            });
-            console.log('');
-        });
-    }
-
-    /**
-     * Generate actionable recommendations based on cost analysis
-     */
-    private generateRecommendations(costAnalysis: any): Array<{
-        title: string;
-        description: string;
-        potentialSavings?: string;
-    }> {
-        const recommendations = [];
-        const topServices = costAnalysis.historical.costByService?.slice(0, 5) || [];
-        const totalCost = costAnalysis.historical.totalCost;
-        const analysisDays = Math.max(
-            1,
-            Math.ceil((new Date(costAnalysis.historical.endDate).getTime() - new Date(costAnalysis.historical.startDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
-        );
-
-        // Recommendation 1: Top service optimization
-        if (topServices.length > 0) {
-            const topService = topServices[0];
-            const savingsEstimate = (topService.cost * 0.2).toFixed(2); // Assume 20% optimization potential
-            
-            let description = '';
-            
-            if (topService.serviceName.toLowerCase().includes('storage')) {
-                description = 'Review storage lifecycle policies, delete unused blobs, and move cold data to Archive tier.';
-            } else if (topService.serviceName.toLowerCase().includes('virtual machine')) {
-                description = 'Consider Reserved Instances for consistent workloads, right-size underutilized VMs, and use auto-shutdown for dev/test.';
-            } else if (topService.serviceName.toLowerCase().includes('database') || topService.serviceName.toLowerCase().includes('sql')) {
-                description = 'Review DTU/vCore sizing, consider serverless tier for variable workloads, and optimize query performance.';
-            } else if (topService.serviceName.toLowerCase().includes('backup')) {
-                description = 'Review backup retention policies, remove backups for deleted resources, and adjust backup frequency.';
-            } else if (topService.serviceName.toLowerCase().includes('bastion')) {
-                description = 'Consider scheduled auto-shutdown for non-production hours or explore alternative remote access solutions.';
-            } else {
-                description = `Review usage patterns and explore optimization opportunities for ${topService.serviceName}.`;
-            }
-
-            recommendations.push({
-                title: `Optimize ${topService.serviceName} (${topService.percentageOfTotal.toFixed(1)}% of costs)`,
-                description,
-                potentialSavings: `~$${savingsEstimate} USD/${analysisDays} days`
-            });
-        }
-
-        // Recommendation 2: Anomaly investigation
-        if (costAnalysis.anomalies?.length > 0) {
-            const highAnomalies = costAnalysis.anomalies.filter((a: any) => 
-                a.severity === 'high' || a.severity === 'critical'
-            ).length;
-            
-            if (highAnomalies > 0) {
-                recommendations.push({
-                    title: `Investigate ${highAnomalies} High-Priority Cost Anomalies`,
-                    description: 'Review unusual spending spikes to identify misconfigurations, runaway processes, or unexpected usage patterns.'
-                });
-            }
-        }
-
-        // Recommendation 3: Cost trend analysis
-        const comparison = costAnalysis.current.comparisonToPreviousMonth;
-        if (comparison.changePercent > 20) {
-            recommendations.push({
-                title: `Cost Increase Alert: +${comparison.changePercent.toFixed(1)}% Month-over-Month`,
-                description: 'Significant cost increase detected. Review new resource deployments and usage changes.',
-                potentialSavings: `Address to prevent +$${Math.abs(comparison.changeAmount).toFixed(2)} monthly increase`
-            });
-        } else if (comparison.changePercent < -20) {
-            recommendations.push({
-                title: `Cost Optimization Success: ${comparison.changePercent.toFixed(1)}% Reduction`,
-                description: 'Great job! Continue monitoring to ensure savings are sustained and explore similar optimizations for other services.'
-            });
-        }
-
-        // Recommendation 4: Reserved capacity opportunities
-        const computeCosts = topServices.filter((s: any) => 
-            s.serviceCategory === 'Compute' && s.percentageOfTotal > 15
-        );
-        
-        if (computeCosts.length > 0) {
-            const computeCost = computeCosts[0];
-            const reservationSavings = (computeCost.cost * 0.30).toFixed(2); // 30% typical RI savings
-            
-            recommendations.push({
-                title: 'Consider Reserved Instances/Capacity',
-                description: 'For consistent compute workloads, Reserved Instances can save 30-72% compared to pay-as-you-go.',
-                potentialSavings: `~$${reservationSavings} USD/${analysisDays} days`
-            });
-        }
-
-        // Recommendation 5: Tagging and cost allocation
-        recommendations.push({
-            title: 'Implement Cost Allocation Tags',
-            description: 'Tag resources by department, project, or environment to enable detailed cost tracking and chargeback.',
-        });
-
-        // Recommendation 6: Budget alerts
-        const avgMonthlyCost = costAnalysis.summary.avgDailySpend * 30;
-        recommendations.push({
-            title: 'Set Up Budget Alerts',
-            description: `Create budget alerts at $${(avgMonthlyCost * 0.8).toFixed(2)}, $${avgMonthlyCost.toFixed(2)}, and $${(avgMonthlyCost * 1.2).toFixed(2)} to catch unexpected spending.`,
-        });
-
-        return recommendations.slice(0, 6); // Return top 6 recommendations
-    }
-
-    /**
-     * Save assessment results to JSON file
-     */
-    private async saveResults(costAnalysis: any, recommendations?: any[], recommendationSummary?: any, vmCostSummary?: VMCostSummary): Promise<void> {
-        try {
-            const outputDir = path.join(process.cwd(), 'reports');
-            
-            // Create reports directory if it doesn't exist
-            if (!fs.existsSync(outputDir)) {
-                fs.mkdirSync(outputDir, { recursive: true });
-            }
-
-            const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
-            
-            // Save JSON report
-            const jsonFilename = `finops-assessment-${timestamp}.json`;
-            const jsonFilepath = path.join(outputDir, jsonFilename);
-
-            const report: any = {
-                generatedAt: new Date().toISOString(),
-                costAnalysis
-            };
-
-            // Add smart recommendations if available
-            if (recommendations && recommendationSummary) {
-                report.smartRecommendations = {
-                    summary: recommendationSummary,
-                    recommendations: recommendations
-                };
-            }
-
-            // Add VM cost analysis if available
-            if (vmCostSummary) {
-                report.vmCostAnalysis = vmCostSummary;
-            }
-
-            fs.writeFileSync(jsonFilepath, JSON.stringify(report, null, 2));
-            logInfo(`\n${colors.success('[OK]')} JSON report saved to: ${jsonFilepath}`);
-
-            // Generate HTML report
-            const htmlFilename = `finops-assessment-${timestamp}.html`;
-            const htmlFilepath = path.join(outputDir, htmlFilename);
-            
-            const htmlContent = this.htmlGenerator.generate(
-                costAnalysis,
-                recommendations,
-                recommendationSummary,
-                vmCostSummary
-            );
-            
-            fs.writeFileSync(htmlFilepath, htmlContent, 'utf-8');
-            logInfo(`${colors.success('[OK]')} HTML report saved to: ${htmlFilepath}`);
-            
-        } catch (error) {
-            logError(`Error saving results: ${error}`);
+            fs.writeFileSync(`${base}.json`, JSON.stringify({ generatedAt: new Date().toISOString(), costAnalysis: analysis }, null, 2));
+            fs.writeFileSync(`${base}.html`, html, 'utf8');
+        } catch {
+            throw new Error('Required report output could not be saved. Check local file permissions and disk space.');
         }
     }
 }
 
-// Main execution
-async function main() {
+export function parseReportArguments(args: string[]): { monthly: boolean; month?: string } {
+    if (!args.length) return { monthly: false };
+    if (args[0] !== '--monthly' || args.length > 2) throw new Error('Usage: npm start -- [--monthly [YYYY-MM]]');
+    const month = closedMonthWindow(args[1], new Date()).month;
+    return { monthly: true, month };
+}
+
+async function main(): Promise<void> {
+    const options = parseReportArguments(process.argv.slice(2));
+    const setup = new InteractiveSetup();
     try {
-        // Always verify Azure authentication first
-        const setup = new InteractiveSetup();
-        const authValid = await setup.verifyAuthentication();
-        
-        if (!authValid) {
-            console.log('\n❌ Azure authentication required. Please try again.');
-            process.exit(1);
-        }
-
-        // Resolve Azure subscription/tenant context at runtime (no hardcoded IDs required)
-        const runtimeContext = await setup.getRuntimeSubscriptionContext();
-        if (!runtimeContext) {
-            console.log('\n❌ Could not resolve Azure subscription context.');
-            process.exit(1);
-        }
-
-        process.env.AZURE_SUBSCRIPTION_ID = runtimeContext.id;
-        process.env.AZURE_TENANT_ID = runtimeContext.tenantId;
-        process.env.AZURE_SCOPE = `/subscriptions/${runtimeContext.id}`;
-
-        const selectedHistoricalDays = await setup.chooseAnalysisWindowDays(30);
-        process.env.HISTORICAL_DAYS = String(selectedHistoricalDays);
-        console.log(`✅ Analysis window set to ${selectedHistoricalDays} days`);
-
-        await setup.maybePersistDefaultSubscription(runtimeContext);
-
-        // Reload config so all services use the runtime context
+        if (!await setup.verifyAuthentication()) throw new Error('Azure CLI authentication is required.');
+        const context = await setup.getRuntimeSubscriptionContext();
+        if (!context) throw new Error('A subscription context is required.');
+        process.env.AZURE_SUBSCRIPTION_ID = context.id;
+        process.env.AZURE_TENANT_ID = context.tenantId;
+        process.env.AZURE_SCOPE = `/subscriptions/${context.id}`;
+        if (!options.monthly) process.env.HISTORICAL_DAYS = String(await setup.chooseAnalysisWindowDays(30));
+        await setup.maybePersistDefaultSubscription(context);
         configService.reload();
-
-        console.log('\nStarting cost analysis...\n');
-
         const app = new FinOpsAssessmentApp();
-        await app.run();
-        process.exit(0);
-    } catch (error) {
-        logError(`Application error: ${error}`);
-        process.exit(1);
-    }
+        if (options.monthly) await app.runMonthly(options.month);
+        else await app.run();
+    } finally { setup.close(); }
 }
 
-// Run the application
-main();
+if (require.main === module) {
+    main().catch(error => {
+        console.error(error instanceof Error ? error.message : 'Assessment failed.');
+        process.exitCode = 1;
+    });
+}

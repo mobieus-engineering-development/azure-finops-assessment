@@ -20,7 +20,7 @@ npm run validate
 
 This script checks:
 
-- Node.js version (18+)
+- Node.js version (24 LTS recommended; 22 LTS also covered by CI)
 - Environment configuration readiness
 - Azure CLI availability and login state
 - Installed npm dependencies
@@ -171,4 +171,4 @@ az-cost-assessment/
 
 Estimated setup time: 10-15 minutes.
 
-Prerequisites: Node.js 18+, Azure subscription, Azure CLI.
+Prerequisites: Node.js 24 LTS recommended, Azure subscription, Azure CLI.

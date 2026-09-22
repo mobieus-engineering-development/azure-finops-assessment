@@ -6,9 +6,12 @@
 import { ComprehensiveCostAnalysis, DailyCostFluctuation } from '../models/costAnalysis';
 import { Recommendation, RecommendationSummary } from '../models/recommendation';
 import { VMCostSummary, VMCostAnalysis, VMCostRecommendation } from '../models/vmCostAnalysis';
-import { format, isWeekend } from 'date-fns';
+import { format } from 'date-fns';
 
 export class HtmlReportGenerator {
+    private dateLabel(value: string): string {
+        return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(value));
+    }
     
     private escapeHtml(text: string): string {
         return text
@@ -19,14 +22,13 @@ export class HtmlReportGenerator {
             .replace(/'/g, '&#039;');
     }
 
-    private formatCurrency(amount: number, currency: string = 'USD'): string {
-        const isNegative = amount < 0;
-        const absolute = Math.abs(amount);
-        const formatted = `$${absolute.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
-        return isNegative ? `-${formatted}` : formatted;
+    private formatCurrency(amount: number | null, currency: string = 'USD'): string {
+        if (amount === null || !Number.isFinite(amount)) return 'Unavailable';
+        return new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'code' }).format(amount);
     }
 
-    private formatPercent(value: number): string {
+    private formatPercent(value: number | null): string {
+        if (value === null || !Number.isFinite(value)) return 'N/A';
         const sign = value > 0 ? '+' : '';
         return `${sign}${value.toFixed(1)}%`;
     }
@@ -658,7 +660,7 @@ tbody tr:hover {
                 </div>
                 <div class="meta-item">
                     <span class="meta-label">Analysis Period:</span>
-                    <span>${this.escapeHtml(format(new Date(analysis.historical.startDate), 'MMM dd, yyyy'))} - ${this.escapeHtml(format(new Date(analysis.historical.endDate), 'MMM dd, yyyy'))}</span>
+                    <span>${this.escapeHtml(this.dateLabel(analysis.historical.startDate))} - ${this.escapeHtml(this.dateLabel(analysis.historical.endDate))} (UTC)</span>
                 </div>
                 <div class="meta-item">
                     <span class="meta-label">Generated:</span>
@@ -666,13 +668,16 @@ tbody tr:hover {
                 </div>
                 <div class="meta-item">
                     <span class="meta-label">Data Mode:</span>
-                    <span>${provenance.mode === 'live' ? 'LIVE VERIFIED' : 'FALLBACK'}</span>
+                    <span>${provenance.mode === 'live' ? 'LIVE API — PROVISIONAL COSTS' : 'UNVERIFIED'}</span>
                 </div>
                 <div class="meta-item">
                     <span class="meta-label">Throttle Policy:</span>
-                    <span>${provenance.queryPolicy.apiDelayMs}ms delay, ${provenance.queryPolicy.maxRetries} retries</span>
+                    <span>${provenance.queryPolicy.apiDelayMs}ms delay, ${provenance.queryPolicy.maxRetries} maximum attempts</span>
                 </div>
             </div>
+            <p>${this.escapeHtml(provenance.coverage || 'Coverage not specified')} — ${this.escapeHtml(provenance.costBasis || 'Cost basis not specified')}</p>
+            <p>Queried through (UTC): ${this.escapeHtml(provenance.queriedThrough || 'Not specified')}</p>
+            ${(provenance.notices || []).map(note => `<p>${this.escapeHtml(note)}</p>`).join('')}
         </header>`;
     }
 
@@ -681,7 +686,7 @@ tbody tr:hover {
         const current = analysis.current;
         const analysisDays = Math.max(
             1,
-            Math.ceil((new Date(analysis.historical.endDate).getTime() - new Date(analysis.historical.startDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
+            Math.floor((new Date(analysis.historical.endDate).getTime() - new Date(analysis.historical.startDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
         );
         
         return `
@@ -693,21 +698,21 @@ tbody tr:hover {
                     <div class="summary-value">${this.formatCurrency(summary.totalHistoricalCost, summary.currency)}</div>
                 </div>
                 <div class="summary-card">
-                    <div class="summary-label">Month to Date</div>
+                    <div class="summary-label">Month to Date (excluding today)</div>
                     <div class="summary-value">${this.formatCurrency(summary.currentMonthToDate, summary.currency)}</div>
                     <div class="summary-subtitle">Estimated: ${this.formatCurrency(summary.forecastedMonthEnd, summary.currency)}</div>
                 </div>
                 <div class="summary-card">
-                    <div class="summary-label">Average Daily</div>
+                    <div class="summary-label">Average per observed day</div>
                     <div class="summary-value">${this.formatCurrency(summary.avgDailySpend, summary.currency)}</div>
                     <div class="summary-subtitle">Peak: ${this.formatCurrency(summary.peakDailySpend, summary.currency)}</div>
                 </div>
                 <div class="summary-card">
-                    <div class="summary-label">Month over Month</div>
-                    <div class="summary-value ${current.monthlyComparison.projectedChange.amount < 0 ? 'text-success' : 'text-danger'}">
-                        ${this.formatPercent(current.monthlyComparison.projectedChange.percent)}
+                    <div class="summary-label">Closed-month change</div>
+                    <div class="summary-value">
+                        ${this.formatPercent(current.monthlyComparison.lastTwoMonthsChange.percent)}
                     </div>
-                    <div class="summary-subtitle">${this.formatCurrency(Math.abs(current.monthlyComparison.projectedChange.amount), summary.currency)}</div>
+                    <div class="summary-subtitle">${this.formatCurrency(current.monthlyComparison.lastTwoMonthsChange.amount, summary.currency)}</div>
                 </div>
             </div>
         </section>`;
@@ -763,8 +768,8 @@ tbody tr:hover {
             <div class="daily-costs-grid">
                 ${analysis.current.dailyCosts.slice(-14).map(day => `
                     <div class="daily-cost-item">
-                        <div class="daily-cost-date">${this.escapeHtml(format(new Date(day.date), 'MMM dd'))}</div>
-                        <div class="daily-cost-amount">$${day.cost.toFixed(0)}</div>
+                        <div class="daily-cost-date">${this.escapeHtml(this.dateLabel(day.date))}</div>
+                        <div class="daily-cost-amount">${this.formatCurrency(day.cost, day.currency)}</div>
                     </div>
                 `).join('')}
             </div>
@@ -878,7 +883,7 @@ tbody tr:hover {
                         <div class="anomaly-header">
                             <div>
                                 <div class="anomaly-title">
-                                    ${this.escapeHtml(format(new Date(fluctuation.previousDate), 'MMM dd'))} → ${this.escapeHtml(format(new Date(fluctuation.date), 'MMM dd'))}
+                                    ${this.escapeHtml(this.dateLabel(fluctuation.previousDate))} → ${this.escapeHtml(this.dateLabel(fluctuation.date))} (UTC)
                                 </div>
                                 <div style="font-size: 12px; color: #888; margin-top: 4px;">
                                     Total daily change: <strong class="${increase ? 'text-danger' : 'text-success'}">${this.formatCurrency(fluctuation.totalChangeAmount, analysis.summary.currency)} (${this.formatPercent(fluctuation.totalChangePercent)})</strong>
@@ -951,20 +956,20 @@ tbody tr:hover {
                     ${lowCount > 0 ? `<span class="badge severity-low">${lowCount} Low</span>` : ''}
                 </div>
             </div>
-            <p style="font-size: 12px; color: #666; margin-bottom: 16px;">Showing top anomalies by severity from the last 60 days. Low-severity anomalies are filtered out.</p>
+            <p style="font-size: 12px; color: #666; margin-bottom: 16px;">Descriptive flags against the observed-period mean, using configured lookback and severity thresholds. These are not calibrated probabilities or causal findings.</p>
             
             <div class="anomaly-list">
                 ${analysis.anomalies.map(anomaly => {
                     const anomalyDate = new Date(anomaly.detectedDate);
-                    const isWeekendDay = isWeekend(anomalyDate);
-                    const dayName = format(anomalyDate, 'EEEE');
+                    const isWeekendDay = [0, 6].includes(anomalyDate.getUTCDay());
+                    const dayName = anomalyDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
                     return `
                     <div class="anomaly-card">
                         <div class="anomaly-header">
                             <div>
                                 <div class="anomaly-title">${this.escapeHtml(anomaly.description)}</div>
                                 <div style="font-size: 12px; color: #888; margin-top: 4px;">
-                                    ${this.escapeHtml(format(anomalyDate, 'MMM dd, yyyy HH:mm'))}${isWeekendDay ? ` <span style="background: #f0e6ff; color: #6b21a8; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-left: 6px;">📅 ${dayName}</span>` : ''}
+                                    ${this.escapeHtml(this.dateLabel(anomaly.detectedDate))} UTC${isWeekendDay ? ` <span style="background: #f0e6ff; color: #6b21a8; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-left: 6px;">📅 ${dayName}</span>` : ''}
                                 </div>
                             </div>
                             <span class="badge ${this.getSeverityClass(anomaly.severity)}">
@@ -974,7 +979,7 @@ tbody tr:hover {
                         
                         <div class="anomaly-details">
                             <div class="anomaly-detail-item">
-                                <div class="anomaly-detail-label">Expected Cost</div>
+                                <div class="anomaly-detail-label">Observed-period mean</div>
                                 <div class="anomaly-detail-value">${this.formatCurrency(anomaly.expectedCost, analysis.summary.currency)}</div>
                             </div>
                             <div class="anomaly-detail-item">
@@ -1043,10 +1048,10 @@ tbody tr:hover {
                             <td class="table-primary">${this.escapeHtml(service.serviceName)}</td>
                             <td>${this.escapeHtml(service.serviceCategory)}</td>
                             <td class="table-number">${this.formatCurrency(service.cost, service.currency)}</td>
-                            <td class="table-number">${service.percentageOfTotal.toFixed(1)}%</td>
+                            <td class="table-number">${this.formatPercent(service.percentageOfTotal)}</td>
                             <td style="min-width: 150px;">
                                 <div class="progress-bar">
-                                    <div class="progress-fill" style="width: ${service.percentageOfTotal}%"></div>
+                                    <div class="progress-fill" style="width: ${Math.max(0, Math.min(100, service.percentageOfTotal || 0))}%"></div>
                                 </div>
                             </td>
                         </tr>
@@ -1065,9 +1070,9 @@ tbody tr:hover {
             <section class="section">
                 <div class="section-header">
                     <h2 class="section-title">Optimization Recommendations</h2>
-                    <span class="section-badge">0 Recommendations</span>
+                    <span class="section-badge">Not assessed</span>
                 </div>
-                <p class="text-muted">No optimization recommendations generated. Your resources appear to be well-optimized.</p>
+                <p class="text-muted">Optimization opportunities and potential savings were not assessed. No conclusion about resource efficiency can be drawn from this cost report.</p>
             </section>`;
         }
 
