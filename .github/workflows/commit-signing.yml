@@ -2,7 +2,6 @@ name: Commit Signing
 
 on:
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -26,21 +25,22 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           echo "Checking commits from $BASE_SHA to $HEAD_SHA"
 
           UNSIGNED=""
           while IFS= read -r commit; do
-            SIG=$(git log -1 --format="%G?" "$commit")
-            case "$SIG" in
-              G|U|X|Y|E)
-                echo "✅ $commit — signed (status: $SIG)"
-                ;;
-              N|B|"")
-                echo "❌ $commit — unsigned or bad signature (status: $SIG)"
-                UNSIGNED="$UNSIGNED $commit"
-                ;;
-            esac
+            # GitHub verifies registered GPG/SSH/S/MIME signatures. Local %G?
+            # cannot reliably verify keys missing from the ephemeral runner.
+            VERIFIED=$(gh api "repos/$REPOSITORY/commits/$commit" --jq '.commit.verification.verified')
+            if [ "$VERIFIED" = "true" ]; then
+              echo "✅ $commit — verified by GitHub"
+            else
+              echo "❌ $commit — signature is not verified by GitHub"
+              UNSIGNED="$UNSIGNED $commit"
+            fi
           done < <(git rev-list "$BASE_SHA".."$HEAD_SHA")
 
           if [ -n "$UNSIGNED" ]; then
@@ -50,7 +50,7 @@ jobs:
               git log -1 --oneline "$c"
             done
             echo ""
-            echo "All commits to main must be GPG-signed."
+            echo "All PR commits must have a GitHub-verified signature."
             echo "See: https://docs.github.com/en/authentication/managing-commit-signature-verification"
             exit 1
           fi
