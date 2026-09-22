@@ -81,6 +81,8 @@ Tests use synthetic billing fixtures and make no Azure changes. Legacy Azure int
 
 ## Project guidance
 
+- [Repository health and housekeeping](docs/repository-health.md)
+
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
 - [Changelog](CHANGELOG.md)

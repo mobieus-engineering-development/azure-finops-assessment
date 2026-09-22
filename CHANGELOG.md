@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintenance — repository health
+
+- Patched compatible dependencies to resolve current npm audit findings; Node 22 minimum reflects the updated Azure Identity requirement.
+- Made moderate-or-higher dependency audit failures blocking, added Node 22/24 CI coverage and enabled checks for stacked PRs.
+- Verify signatures through GitHub's verification result; group dependency updates and correct repository links.
+- Documented commit-signing repair, required-check migration and PR backlog disposition.
+
 ### Added — monthly reporting
 
 - Closed-calendar-month review packs via `npm start -- --monthly [YYYY-MM]`, defaulting to the previous month.
