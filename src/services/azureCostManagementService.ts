@@ -3,6 +3,8 @@ import { ComprehensiveCostAnalysis, HistoricalCostData, CurrentCostData, Forecas
     CostDataPoint, DailyServiceCostPoint, CostByResource } from '../models/costAnalysis';
 import { configService } from '../utils/config';
 import { azureCostTransport, CostTransport, sumCosts, usageDate, percentChange, retryAfterMs } from './costQuery';
+import { MonthlyCostEvidence } from '../models/monthlyReport';
+import { closedMonthWindow } from './monthlyReport';
 
 const DAY = 86_400_000;
 const monthStart = (date: Date, offset = 0) => new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + offset, 1));
@@ -156,6 +158,21 @@ export class AzureCostManagementService {
                 resourceCount: new Set(costByResource.filter(x => x.resourceGroup === r.name && x.resourceId).map(x => x.resourceId.toLowerCase())).size })) };
         this.queryCache.set(key, { value: result, timestamp: Date.now() });
         return result;
+    }
+
+    public async getMonthlyCostEvidence(month?: string): Promise<MonthlyCostEvidence> {
+        if (this.reportDate) throw new Error('A report is already being collected by this service.');
+        const now = this.clock(), window = closedMonthWindow(month, now);
+        this.reportDate = now;
+        this.queryCache.clear(); this.collectedPages = 0;
+        try {
+            const current = { startDate: window.start.toISOString(), endDate: window.end.toISOString(), ...await this.queryActualCosts(window.start, window.end) };
+            const previousEnd = new Date(window.start.getTime() - 1);
+            const previous = { startDate: window.previousStart.toISOString(), endDate: previousEnd.toISOString(), ...await this.queryActualCosts(window.previousStart, previousEnd) };
+            if (current.currency !== previous.currency) throw new Error('Currency changed across months; comparison is unavailable.');
+            return { month: window.month, generatedAt: now.toISOString(), scope: this.scope, costBasis: 'ActualCost',
+                source: 'Azure Cost Management Query API', collectedPages: this.collectedPages, current, previous };
+        } finally { this.reportDate = undefined; this.queryCache.clear(); }
     }
 
     public async getHistoricalCostData(days = 30): Promise<HistoricalCostData> {

@@ -9,10 +9,21 @@ import { InteractiveSetup } from './utils/interactiveSetup';
 import { formatCurrency, formatPercentChange } from './utils/colors';
 import * as fs from 'fs';
 import * as path from 'path';
+import { buildMonthlyReport, closedMonthWindow } from './services/monthlyReport';
+import { writeMonthlyReport } from './services/monthlyReportWriter';
 
 /** Financial reporting only. No recommendation execution or cloud storage writes. */
 export class FinOpsAssessmentApp {
     constructor(private readonly costService = new AzureCostManagementService()) {}
+
+    public async runMonthly(month?: string): Promise<void> {
+        const report = buildMonthlyReport(await this.costService.getMonthlyCostEvidence(month));
+        const directory = writeMonthlyReport(report);
+        console.log(`\nMONTHLY FINOPS REVIEW — ${report.evidence.month} — READ ONLY`);
+        for (const observation of report.observations) console.log(observation);
+        console.log('Single subscription; provisional ActualCost. Budget, forecast and savings are not assessed.');
+        console.log(`Report pack saved: ${directory}`);
+    }
 
     public async run(): Promise<void> {
         const analysis = await this.costService.getComprehensiveCostAnalysis();
@@ -59,7 +70,15 @@ export class FinOpsAssessmentApp {
     }
 }
 
+export function parseReportArguments(args: string[]): { monthly: boolean; month?: string } {
+    if (!args.length) return { monthly: false };
+    if (args[0] !== '--monthly' || args.length > 2) throw new Error('Usage: npm start -- [--monthly [YYYY-MM]]');
+    const month = closedMonthWindow(args[1], new Date()).month;
+    return { monthly: true, month };
+}
+
 async function main(): Promise<void> {
+    const options = parseReportArguments(process.argv.slice(2));
     const setup = new InteractiveSetup();
     try {
         if (!await setup.verifyAuthentication()) throw new Error('Azure CLI authentication is required.');
@@ -68,10 +87,12 @@ async function main(): Promise<void> {
         process.env.AZURE_SUBSCRIPTION_ID = context.id;
         process.env.AZURE_TENANT_ID = context.tenantId;
         process.env.AZURE_SCOPE = `/subscriptions/${context.id}`;
-        process.env.HISTORICAL_DAYS = String(await setup.chooseAnalysisWindowDays(30));
+        if (!options.monthly) process.env.HISTORICAL_DAYS = String(await setup.chooseAnalysisWindowDays(30));
         await setup.maybePersistDefaultSubscription(context);
         configService.reload();
-        await new FinOpsAssessmentApp().run();
+        const app = new FinOpsAssessmentApp();
+        if (options.monthly) await app.runMonthly(options.month);
+        else await app.run();
     } finally { setup.close(); }
 }
 
