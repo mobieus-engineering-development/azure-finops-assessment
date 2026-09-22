@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — financial and operational evidence
+
+- Opt-in monthly inventory, cached Advisor Cost and historical VM CPU evidence via `--with-operations`.
+- Cost-preserving resource joins, explicit source failures, sample coverage and exclusion of unvalidated/old Advisor candidates.
+- Enriched HTML, schema 1.1 JSON and three additional CSV exports; no execution or aggregate savings estimates.
+
 ### Maintenance — repository health
 
 - Patched compatible dependencies to resolve current npm audit findings; Node 22 minimum reflects the updated Azure Identity requirement.

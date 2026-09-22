@@ -46,6 +46,14 @@ The pack includes an executive readout, month-over-month cost changes, service a
 
 See [monthly reporting](docs/monthly-reporting.md) for definitions, evidence boundaries and workflow. This mode works on the first UTC day of a month because it only uses closed months.
 
+### Connect operational evidence
+
+```powershell
+npm start -- --monthly 2026-08 --with-operations
+```
+
+This opt-in mode joins billed resource costs to current inventory and cached Advisor findings, then collects selected-month hourly CPU averages for up to 100 billed VMs present in inventory. The report shows missing telemetry, unmatched/stale findings and partial source failures explicitly. It adds three evidence CSVs and preserves every billed charge. No recommendations are executed or savings added together. See [the operational evidence contract](docs/operational-evidence.md).
+
 ## Configuration
 
 Defaults are in `config/default.json`; examples are in `.env.example`.
@@ -66,7 +74,7 @@ AZURE_COST_RETRY_MAX_DELAY_MS=120000
 - Results spanning multiple currencies are rejected rather than summed. Currency-separated tenant aggregation is future work.
 - A required period with no billing rows is unknown, not verified zero; it stops this version of the report. Explicit zero-valued rows are supported.
 - The rolling assessment cannot run on the first UTC day of a month because no completed MTD day exists. Monthly mode supports that date; partial-result reporting remains a follow-up.
-- Inventory enrichment, Advisor opportunities, utilization and savings verification are not included in the active report.
+- Financial-only mode does not collect operational evidence. Optional enrichment includes inventory, cached Advisor and VM CPU; comprehensive utilization and savings verification remain out of scope.
 - API data can arrive late or be rerated. Successful pagination and reconciliation do not establish billing freshness.
 
 ## Validate

@@ -39,7 +39,7 @@ Keep the folder intact for download links. Browser Print → Save as PDF produce
 
 This version covers one selected subscription in one currency. A required empty month, currency mismatch, malformed result or failed reconciliation stops the report. Partial reports and tenant-wide rollups are future work. A calendar-closed month is still provisional billing evidence, not a reconciled invoice. Coverage is evidence of returned dates, not proof of billing freshness.
 
-Budget, forecast, ownership mapping, optimization opportunities and verified savings are explicitly not assessed. The monthly product adds no pricing estimates, resource mutations, cloud storage or scheduled delivery.
+Budget, forecast, verified ownership and savings are explicitly not assessed. Optional [operational evidence](operational-evidence.md) adds current inventory, native Advisor findings and historical VM CPU via `--with-operations`, with separate coverage and timestamps. Financial-only mode retains its original six files. The monthly product adds no pricing estimates, resource mutations, cloud storage or scheduled delivery.
 
 Exports are written into a `.monthly-pending-...` folder and published by renaming only after all six files are written. A failed write leaves an explicitly incomplete folder and returns failure. Completed reports are never overwritten.
 
