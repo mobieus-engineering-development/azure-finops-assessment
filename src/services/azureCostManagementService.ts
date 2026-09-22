@@ -1,802 +1,226 @@
-/**
- * Azure Cost Management Service
- * Fetches historical, current, and forecasted cost data using Azure Cost Management APIs
- * Uses Managed Identity authentication (preferred) with fallback to other methods
- */
-
-import { AzureCliCredential } from '@azure/identity';
-import { CostManagementClient } from '@azure/arm-costmanagement';
-import { 
-    ComprehensiveCostAnalysis,
-    HistoricalCostData,
-    CurrentCostData,
-    ForecastedCostData,
-    CostDataPoint,
-    DailyServiceCostPoint,
-    CostByResource,
-    CostByService,
-    ForecastDataPoint 
-} from '../models/costAnalysis';
+import { QueryDefinition } from '@azure/arm-costmanagement';
+import { ComprehensiveCostAnalysis, HistoricalCostData, CurrentCostData, ForecastedCostData,
+    CostDataPoint, DailyServiceCostPoint, CostByResource } from '../models/costAnalysis';
 import { configService } from '../utils/config';
-import { logInfo, logError, logWarning } from '../utils/logger';
-import { subDays, format, startOfMonth, endOfMonth, addDays, subMonths } from 'date-fns';
+import { azureCostTransport, CostTransport, sumCosts, usageDate, percentChange, retryAfterMs } from './costQuery';
 
+const DAY = 86_400_000;
+const monthStart = (date: Date, offset = 0) => new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + offset, 1));
+const midnight = (date: Date) => Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+const monthName = (date: Date) => date.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+type Period = Omit<HistoricalCostData, 'startDate' | 'endDate'>;
+type Row = Record<string, unknown>;
+
+function group(rows: Row[], name: string): Array<{ name: string; cost: number }> {
+    const map = new Map<string, number[]>();
+    for (const row of rows) {
+        const key = String(row[name] || 'Unallocated');
+        if (!map.has(key)) map.set(key, []);
+        map.get(key)!.push(Number(row.Cost));
+    }
+    return [...map].map(([name, costs]) => ({ name, cost: sumCosts(costs) }));
+}
+
+/** Single-subscription, read-only ActualCost collection. Never substitutes mock billing data. */
 export class AzureCostManagementService {
-    private client: CostManagementClient;
-    private credential: AzureCliCredential;
-    private subscriptionId: string;
-    private scope: string;
-    private readonly API_DELAY_MS: number;
-    private readonly MAX_RETRIES: number;
-    private readonly RETRY_DELAY_MS: number;
-    private readonly RETRY_MAX_DELAY_MS: number;
-    private readonly LIVE_DATA_ONLY: boolean;
-    
-    // Cache for avoiding redundant API calls within the same session
-    private queryCache: Map<string, { data: any; timestamp: number }> = new Map();
-    private readonly CACHE_TTL_MS = 300000; // 5 minute cache TTL
+    private readonly subscriptionId: string;
+    private readonly scope: string;
+    private readonly transport: CostTransport;
+    private readonly policy: { apiDelayMs: number; maxRetries: number; retryBaseDelayMs: number; retryMaxDelayMs: number };
+    private readonly queryCache = new Map<string, { value: Period; timestamp: number }>();
+    private lastRequestAt: number | undefined;
+    private collectedPages = 0;
+    private reportDate: Date | undefined;
+    private now(): Date { return this.reportDate || this.clock(); }
 
-    constructor() {
-        const azureConfig = configService.getAzureConfig();
-        this.subscriptionId = azureConfig.subscriptionId;
-        this.scope = azureConfig.scope;
-        this.LIVE_DATA_ONLY = azureConfig.costManagement?.liveDataOnly ?? true;
-        this.API_DELAY_MS = azureConfig.costManagement?.apiDelayMs || 5000;
-        this.MAX_RETRIES = azureConfig.costManagement?.maxRetries || 5;
-        this.RETRY_DELAY_MS = azureConfig.costManagement?.retryBaseDelayMs || 15000;
-        this.RETRY_MAX_DELAY_MS = azureConfig.costManagement?.retryMaxDelayMs || 120000;
-        
-        // Force Azure CLI credential so runtime az login/subscription context is honored consistently.
-        this.credential = new AzureCliCredential({ tenantId: azureConfig.tenantId });
-        this.client = new CostManagementClient(this.credential);
-        
-        logInfo('Azure Cost Management Service initialized');
+    constructor(transport?: CostTransport, private readonly clock: () => Date = () => new Date()) {
+        const config = configService.getAzureConfig();
+        this.subscriptionId = config.subscriptionId;
+        this.scope = config.scope.replace(/\/$/, '');
+        if (!this.subscriptionId || this.scope.toLowerCase() !== `/subscriptions/${this.subscriptionId}`.toLowerCase()) {
+            throw new Error('Selected subscription and cost scope must agree. Only subscription scope is supported.');
+        }
+        if (!config.costManagement.liveDataOnly) throw new Error('Synthetic billing fallback is no longer supported. Enable liveDataOnly.');
+        const { apiDelayMs, maxRetries, retryBaseDelayMs, retryMaxDelayMs } = config.costManagement;
+        this.policy = { apiDelayMs, maxRetries, retryBaseDelayMs, retryMaxDelayMs };
+        for (const [name, value] of Object.entries(this.policy)) {
+            if (!Number.isInteger(value) || value < (name === 'maxRetries' ? 1 : 0)) throw new Error(`Invalid Cost Management setting: ${name}.`);
+        }
+        this.transport = transport || azureCostTransport(config.tenantId, this.scope);
     }
 
-    /**
-     * Delay helper to avoid rate limiting
-     */
-    private async delay(ms: number): Promise<void> {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
+    private async delay(ms: number): Promise<void> { if (ms > 0) await new Promise(resolve => setTimeout(resolve, ms)); }
 
-    /**
-     * Execute API call with retry logic for rate limiting
-     */
-    private async executeWithRetry<T>(operation: () => Promise<T>, operationName: string): Promise<T> {
-        for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
-            try {
-                return await operation();
-            } catch (error: any) {
-                const isRateLimitError = error?.message?.includes('Too many requests') || 
-                                        error?.statusCode === 429;
-                
-                if (isRateLimitError && attempt < this.MAX_RETRIES) {
-                    const waitTime = Math.min(this.RETRY_DELAY_MS * Math.pow(2, attempt - 1), this.RETRY_MAX_DELAY_MS);
-                    logWarning(`Rate limit hit for ${operationName}. Waiting ${waitTime}ms before retry ${attempt}/${this.MAX_RETRIES}...`);
-                    await this.delay(waitTime);
-                } else {
-                    throw error;
+    private async request(query: QueryDefinition, nextLink?: string) {
+        for (let attempt = 0; attempt < this.policy.maxRetries; attempt++) {
+            if (this.lastRequestAt !== undefined) await this.delay(Math.max(0, this.policy.apiDelayMs - (Date.now() - this.lastRequestAt)));
+            this.lastRequestAt = Date.now();
+            try { return await this.transport(query, nextLink); }
+            catch (error: any) {
+                const status = error?.statusCode;
+                if ((status !== 429 && status !== 503) || attempt + 1 === this.policy.maxRetries) {
+                    // Do not propagate SDK errors containing identifiers, request bodies or tokens into logs.
+                    throw new Error(`Cost collection failed${status ? ` (HTTP ${status})` : ''}. No report was generated; check access and retry.`);
                 }
+                const wait = Math.max(retryAfterMs(error, Date.now()), Math.min(this.policy.retryBaseDelayMs * 2 ** attempt, this.policy.retryMaxDelayMs));
+                if (wait > this.policy.retryMaxDelayMs) throw new Error('Azure requested a retry delay beyond the wait limit. Stop and retry later.');
+                await this.delay(wait);
             }
         }
-        throw new Error(`Failed after ${this.MAX_RETRIES} retries`);
+        throw new Error('Cost collection did not complete.');
     }
 
-    /**
-     * Generate cache key for query results
-     */
-    private getCacheKey(startDate: Date, endDate: Date, queryType: string): string {
-        return `${queryType}-${format(startDate, 'yyyy-MM-dd')}-${format(endDate, 'yyyy-MM-dd')}`;
-    }
-
-    /**
-     * Get cached result if available and not expired
-     */
-    private getCachedResult(cacheKey: string): any | null {
-        const cached = this.queryCache.get(cacheKey);
-        if (cached && (Date.now() - cached.timestamp) < this.CACHE_TTL_MS) {
-            logInfo(`Using cached result for ${cacheKey}`);
-            return cached.data;
-        }
-        return null;
-    }
-
-    /**
-     * Store result in cache
-     */
-    private setCachedResult(cacheKey: string, data: any): void {
-        this.queryCache.set(cacheKey, { data, timestamp: Date.now() });
-    }
-
-    /**
-     * Get comprehensive cost analysis including historical, current, and forecasted data
-     */
-    public async getComprehensiveCostAnalysis(): Promise<ComprehensiveCostAnalysis> {
-        try {
-            logInfo('Starting comprehensive cost analysis...');
-            logInfo('Using optimized API calls with intelligent caching...');
-            
-            const analysisConfig = configService.getAnalysisConfig();
-            const now = new Date();
-            
-            // Fetch historical data first (will be reused for forecast)
-            logInfo('Fetching historical data...');
-            const historical = await this.getHistoricalCostData(analysisConfig.historicalDays);
-            
-            // Fetch current month data (parallel-friendly queries are batched internally)
-            logInfo('Fetching current month data...');
-            const current = await this.getCurrentCostData();
-            
-            // Generate forecast using cached historical data (no additional API calls needed)
-            logInfo('Generating forecast...');
-            const forecasted = await this.getForecastedCostData(analysisConfig.forecastDays, historical);
-
-            // Calculate summary metrics
-            const summary = this.calculateSummary(historical, current, forecasted);
-
-            const analysis: ComprehensiveCostAnalysis = {
-                id: `analysis-${Date.now()}`,
-                subscriptionId: this.subscriptionId,
-                scope: this.scope,
-                analysisDate: now.toISOString(),
-                historical,
-                current,
-                forecasted,
-                trends: [], // Will be populated by trend analyzer
-                anomalies: [], // Will be populated by anomaly detector
-                fluctuations: [],
-                dataProvenance: {
-                    mode: 'live',
-                    source: 'Azure Cost Management API',
-                    generatedFromFallback: false,
-                    queryPolicy: {
-                        apiDelayMs: this.API_DELAY_MS,
-                        maxRetries: this.MAX_RETRIES,
-                        retryBaseDelayMs: this.RETRY_DELAY_MS,
-                        retryMaxDelayMs: this.RETRY_MAX_DELAY_MS
+    private async collect(start: Date, end: Date, grouping: string[], daily: boolean): Promise<Row[]> {
+        const query: QueryDefinition = { type: 'ActualCost', timeframe: 'Custom', timePeriod: { from: start, to: end },
+            dataset: { granularity: daily ? 'Daily' : 'None', aggregation: { totalCost: { name: 'Cost', function: 'Sum' } },
+                ...(grouping.length ? { grouping: grouping.map(name => ({ type: 'Dimension' as const, name })) } : {}) } };
+        const records: Row[] = [], seen = new Set<string>(), rowKeys = new Set<string>();
+        let nextLink: string | undefined;
+        for (let pageNumber = 0; pageNumber < 1000; pageNumber++) {
+            const page = await this.request(query, nextLink);
+            this.collectedPages++;
+            const names = page.columns?.map(c => c.name || '') || [];
+            if (page.rows?.length) {
+                const required = ['Cost', 'Currency', ...grouping, ...(daily ? ['UsageDate'] : [])];
+                if (names.length !== new Set(names).size || required.some(name => !names.includes(name))) throw new Error('Cost response schema is incomplete or ambiguous.');
+                for (const row of page.rows) {
+                    if (!Array.isArray(row) || row.length !== names.length) throw new Error('Malformed cost response row.');
+                    const record = Object.fromEntries(names.map((name, i) => [name, row[i]]));
+                    if ((typeof record.Cost !== 'number' && typeof record.Cost !== 'string') || String(record.Cost).trim() === '' || !Number.isFinite(Number(record.Cost))) throw new Error('Invalid numeric cost in response.');
+                    if (typeof record.Currency !== 'string' || !/^[A-Z]{3}$/.test(record.Currency)) throw new Error('Cost currency is missing or invalid.');
+                    record.Cost = Number(record.Cost);
+                    if (daily) {
+                        record.UsageDate = usageDate(record.UsageDate);
+                        const time = Date.parse(String(record.UsageDate));
+                        if (time < start.getTime() || time > end.getTime()) throw new Error('Cost response contains a date outside the requested period.');
                     }
-                },
-                summary
-            };
-
-            logInfo('Comprehensive cost analysis completed');
-            return analysis;
-            
-        } catch (error) {
-            logError(`Error in comprehensive cost analysis: ${error}`);
-            throw error;
+                    const rowKey = JSON.stringify([record.Currency, ...(daily ? [record.UsageDate] : []), ...grouping.map(name => record[name])]);
+                    if (rowKeys.has(rowKey)) throw new Error('Duplicate aggregate row across cost pages. Collection is ambiguous.');
+                    rowKeys.add(rowKey);
+                    records.push(record);
+                }
+            }
+            nextLink = page.nextLink;
+            if (!nextLink) return records;
+            if (seen.has(nextLink)) throw new Error('Repeated cost continuation link. Collection is incomplete.');
+            seen.add(nextLink);
         }
+        throw new Error('Cost pagination limit exceeded. Collection is incomplete.');
     }
 
-    /**
-     * Get historical cost data for the specified number of days
-     */
-    public async getHistoricalCostData(days: number = 90): Promise<HistoricalCostData> {
-        try {
-            logInfo(`Fetching historical cost data for ${days} days...`);
-            
-            const endDate = new Date();
-            const startDate = subDays(endDate, days);
-            
-            // Query Azure Cost Management API for actual cost data
-            const queryResult = await this.queryActualCosts(startDate, endDate);
-            
-            const historicalData: HistoricalCostData = {
-                startDate: startDate.toISOString(),
-                endDate: endDate.toISOString(),
-                totalCost: queryResult.totalCost,
-                currency: queryResult.currency || 'USD',
-                dailyCosts: queryResult.dailyCosts,
-                dailyServiceCosts: queryResult.dailyServiceCosts,
-                monthlyCosts: queryResult.monthlyCosts,
-                costByResource: queryResult.costByResource,
-                costByService: queryResult.costByService,
-                costByResourceGroup: queryResult.costByResourceGroup
-            };
-
-            logInfo(`Historical data fetched: ${historicalData.totalCost} ${historicalData.currency}`);
-            return historicalData;
-            
-        } catch (error) {
-            logError(`Error fetching historical cost data: ${error}`);
-            throw error;
+    private async queryActualCosts(start: Date, end: Date): Promise<Period> {
+        const key = `${this.scope}|ActualCost|${start.toISOString()}|${end.toISOString()}`;
+        const cached = this.queryCache.get(key);
+        if (cached && Date.now() - cached.timestamp < 300_000) return cached.value;
+        const dailyRows: Row[] = [], serviceRows: Row[] = [];
+        // Split long daily lookbacks into calendar months.
+        for (let from = start; from <= end;) {
+            const to = new Date(Math.min(end.getTime(), monthStart(from, 1).getTime() - 1));
+            dailyRows.push(...await this.collect(from, to, [], true));
+            serviceRows.push(...await this.collect(from, to, ['ServiceName'], true));
+            from = new Date(to.getTime() + 1);
         }
+        const resources = await this.collect(start, end, ['ResourceId', 'ResourceGroupName'], false);
+        const currencies = new Set([...dailyRows, ...serviceRows, ...resources].map(row => String(row.Currency)));
+        if (!currencies.size) throw new Error('No cost rows returned for a required period. Spend and currency are unknown, not zero.');
+        if (currencies.size !== 1) throw new Error('Multiple currencies returned. Separate currency reports are required; currencies were not added together.');
+        const currency = [...currencies][0], totalCost = sumCosts(dailyRows.map(r => Number(r.Cost)));
+        if (!dailyRows.length || !serviceRows.length || !resources.length ||
+            Math.abs(totalCost - sumCosts(serviceRows.map(r => Number(r.Cost)))) > 0.01 || Math.abs(totalCost - sumCosts(resources.map(r => Number(r.Cost)))) > 0.01) {
+            throw new Error('Daily, service and resource costs do not reconcile. Data may have changed; retry collection.');
+        }
+        const dailyCosts = group(dailyRows, 'UsageDate').map(r => ({ date: r.name, cost: r.cost, currency })).sort((a, b) => a.date.localeCompare(b.date));
+        const dailyServiceCosts: DailyServiceCostPoint[] = [], byServiceDate = new Map<string, Row[]>();
+        for (const row of serviceRows) {
+            const key = JSON.stringify([row.UsageDate, row.ServiceName || 'Unallocated']);
+            if (!byServiceDate.has(key)) byServiceDate.set(key, []);
+            byServiceDate.get(key)!.push(row);
+        }
+        for (const rows of byServiceDate.values()) dailyServiceCosts.push({ date: String(rows[0].UsageDate), serviceName: String(rows[0].ServiceName || 'Unallocated'),
+            serviceCategory: 'Not classified', currency, cost: sumCosts(rows.map(r => Number(r.Cost))) });
+        for (const day of dailyCosts) {
+            if (Math.abs(day.cost - sumCosts(dailyServiceCosts.filter(r => r.date === day.date).map(r => r.cost))) > 0.01) throw new Error('Daily service costs do not reconcile. Attribution is unavailable.');
+        }
+        if (dailyServiceCosts.some(r => !dailyCosts.some(d => d.date === r.date))) throw new Error('Service costs contain unmatched dates.');
+        const costByResource: CostByResource[] = resources.map(row => {
+            const id = String(row.ResourceId || '');
+            return { resourceId: id, resourceName: id.split('/').pop() || 'Unallocated', resourceType: 'Not collected',
+                resourceGroup: String(row.ResourceGroupName || 'Unallocated'), location: 'Not collected', cost: Number(row.Cost), currency };
+        }).sort((a, b) => b.cost - a.cost);
+        const result: Period = { totalCost, currency, dailyCosts, dailyServiceCosts,
+            monthlyCosts: group(dailyRows.map(r => ({ ...r, month: String(r.UsageDate).slice(0, 7) + '-01T00:00:00.000Z' })), 'month')
+                .map(r => ({ date: r.name, cost: r.cost, currency })).sort((a, b) => a.date.localeCompare(b.date)),
+            costByService: group(serviceRows, 'ServiceName').map(r => ({ serviceName: r.name, serviceCategory: 'Not classified', cost: r.cost, currency,
+                percentageOfTotal: totalCost > 0 ? r.cost / totalCost * 100 : null })).sort((a, b) => b.cost - a.cost), costByResource,
+            costByResourceGroup: group(resources, 'ResourceGroupName').map(r => ({ resourceGroup: r.name, cost: r.cost,
+                resourceCount: new Set(costByResource.filter(x => x.resourceGroup === r.name && x.resourceId).map(x => x.resourceId.toLowerCase())).size })) };
+        this.queryCache.set(key, { value: result, timestamp: Date.now() });
+        return result;
     }
 
-    /**
-     * Get current month-to-date cost data
-     */
+    public async getHistoricalCostData(days = 30): Promise<HistoricalCostData> {
+        if (!Number.isInteger(days) || days < 1 || days > 365) throw new Error('Historical days must be an integer from 1 to 365.');
+        const day = midnight(this.now()), start = new Date(day - days * DAY), end = new Date(day - 1);
+        return { startDate: start.toISOString(), endDate: end.toISOString(), ...await this.queryActualCosts(start, end) };
+    }
+
     public async getCurrentCostData(): Promise<CurrentCostData> {
-        try {
-            logInfo('Fetching current month cost data...');
-            
-            const now = new Date();
-            const monthStart = startOfMonth(now);
-            const monthEnd = endOfMonth(now);
-            
-            // Query current month costs
-            const currentMonthQuery = await this.queryActualCosts(monthStart, now);
-            
-            // Add delay before next query
-            await this.delay(this.API_DELAY_MS);
-            
-            // Get previous month (last full month)
-            const prevMonthStart = subMonths(monthStart, 1);
-            const prevMonthEnd = endOfMonth(prevMonthStart);
-            const prevMonthQuery = await this.queryActualCosts(prevMonthStart, prevMonthEnd);
-            
-            // Add delay before next query
-            await this.delay(this.API_DELAY_MS);
-            
-            // Get 2 months ago (second to last full month)
-            const twoMonthsAgoStart = subMonths(monthStart, 2);
-            const twoMonthsAgoEnd = endOfMonth(twoMonthsAgoStart);
-            const twoMonthsAgoQuery = await this.queryActualCosts(twoMonthsAgoStart, twoMonthsAgoEnd);
-            
-            // Calculate estimated month-end cost based on daily average
-            const daysElapsed = Math.floor((now.getTime() - monthStart.getTime()) / (1000 * 60 * 60 * 24)) + 1;
-            const daysInMonth = Math.floor((monthEnd.getTime() - monthStart.getTime()) / (1000 * 60 * 60 * 24)) + 1;
-            const avgDailyCost = currentMonthQuery.totalCost / daysElapsed;
-            const estimatedMonthEndCost = avgDailyCost * daysInMonth;
-            
-            // Old comparison (current partial vs last full) - keeping for backward compatibility
-            const changeAmount = currentMonthQuery.totalCost - prevMonthQuery.totalCost;
-            const changePercent = prevMonthQuery.totalCost > 0 
-                ? (changeAmount / prevMonthQuery.totalCost) * 100 
-                : 0;
-
-            // New 3-month comparison
-            const lastTwoMonthsChangeAmount = prevMonthQuery.totalCost - twoMonthsAgoQuery.totalCost;
-            const lastTwoMonthsChangePercent = twoMonthsAgoQuery.totalCost > 0
-                ? (lastTwoMonthsChangeAmount / twoMonthsAgoQuery.totalCost) * 100
-                : 0;
-                
-            const projectedChangeAmount = estimatedMonthEndCost - prevMonthQuery.totalCost;
-            const projectedChangePercent = prevMonthQuery.totalCost > 0
-                ? (projectedChangeAmount / prevMonthQuery.totalCost) * 100
-                : 0;
-
-            const currentData: CurrentCostData = {
-                billingPeriodStart: monthStart.toISOString(),
-                billingPeriodEnd: monthEnd.toISOString(),
-                currentDate: now.toISOString(),
-                monthToDateCost: currentMonthQuery.totalCost,
-                estimatedMonthEndCost,
-                currency: currentMonthQuery.currency || 'USD',
-                dailyCosts: currentMonthQuery.dailyCosts,
-                topCostResources: currentMonthQuery.costByResource.slice(0, 10),
-                topCostServices: currentMonthQuery.costByService.slice(0, 10),
-                comparisonToPreviousMonth: {
-                    previousMonthTotal: prevMonthQuery.totalCost,
-                    changeAmount,
-                    changePercent
-                },
-                monthlyComparison: {
-                    twoMonthsAgo: {
-                        name: format(twoMonthsAgoStart, 'MMMM yyyy'),
-                        total: twoMonthsAgoQuery.totalCost
-                    },
-                    lastMonth: {
-                        name: format(prevMonthStart, 'MMMM yyyy'),
-                        total: prevMonthQuery.totalCost
-                    },
-                    currentMonth: {
-                        name: format(monthStart, 'MMMM yyyy'),
-                        monthToDate: currentMonthQuery.totalCost,
-                        projected: estimatedMonthEndCost
-                    },
-                    lastTwoMonthsChange: {
-                        amount: lastTwoMonthsChangeAmount,
-                        percent: lastTwoMonthsChangePercent
-                    },
-                    projectedChange: {
-                        amount: projectedChangeAmount,
-                        percent: projectedChangePercent
-                    }
-                }
-            };
-
-            logInfo(`Current month-to-date: ${currentData.monthToDateCost} ${currentData.currency}`);
-            return currentData;
-            
-        } catch (error) {
-            logError(`Error fetching current cost data: ${error}`);
-            throw error;
-        }
+        const now = this.now(), start = monthStart(now), previous = monthStart(now, -1), older = monthStart(now, -2), cutoff = new Date(midnight(now) - 1);
+        if (cutoff < start) throw new Error('No completed UTC day in this month yet. Run after the first day closes.');
+        const current = await this.queryActualCosts(start, cutoff);
+        const last = await this.queryActualCosts(previous, new Date(start.getTime() - 1));
+        const twoAgo = await this.queryActualCosts(older, new Date(previous.getTime() - 1));
+        if (new Set([current.currency, last.currency, twoAgo.currency]).size !== 1) throw new Error('Currency changed across periods; comparison is unavailable.');
+        const comparableDays = Math.min(now.getUTCDate() - 1, new Date(start.getTime() - 1).getUTCDate());
+        const priorComparable = sumCosts(last.dailyCosts.filter(d => new Date(d.date).getUTCDate() <= comparableDays).map(d => d.cost));
+        const currentComparable = sumCosts(current.dailyCosts.filter(d => new Date(d.date).getUTCDate() <= comparableDays).map(d => d.cost));
+        return { billingPeriodStart: start.toISOString(), billingPeriodEnd: new Date(monthStart(now, 1).getTime() - 1).toISOString(), currentDate: now.toISOString(),
+            monthToDateCost: current.totalCost, estimatedMonthEndCost: null, currency: current.currency, dailyCosts: current.dailyCosts,
+            topCostResources: current.costByResource.slice(0, 10), topCostServices: current.costByService.slice(0, 10),
+            comparisonToPreviousMonth: { previousMonthTotal: last.totalCost, changeAmount: currentComparable - priorComparable,
+                changePercent: percentChange(priorComparable, currentComparable), comparableDays, previousComparableCost: priorComparable, currentComparableCost: currentComparable },
+            monthlyComparison: { twoMonthsAgo: { name: monthName(older), total: twoAgo.totalCost }, lastMonth: { name: monthName(previous), total: last.totalCost },
+                currentMonth: { name: monthName(start), monthToDate: current.totalCost, projected: null },
+                lastTwoMonthsChange: { amount: last.totalCost - twoAgo.totalCost, percent: percentChange(twoAgo.totalCost, last.totalCost) }, projectedChange: { amount: null, percent: null } } };
     }
 
-    /**
-     * Get forecasted cost data for the specified number of days
-     * @param days Number of days to forecast
-     * @param existingHistoricalData Optional pre-fetched historical data to avoid redundant API calls
-     */
-    public async getForecastedCostData(days: number = 30, existingHistoricalData?: HistoricalCostData): Promise<ForecastedCostData> {
-        try {
-            logInfo(`Generating cost forecast for ${days} days...`);
-            
-            const startDate = addDays(new Date(), 1);
-            const endDate = addDays(startDate, days);
-            
-            // Use provided historical data or fetch fresh (with caching)
-            const historicalData = existingHistoricalData || await this.getHistoricalCostData(30);
-            const historicalDays = historicalData.dailyCosts.length || 30;
-            const avgDailyCost = historicalData.totalCost / historicalDays;
-            
-            const dailyForecasts: ForecastDataPoint[] = [];
-            let cumulativeCost = 0;
-            
-            for (let i = 0; i < days; i++) {
-                const forecastDate = addDays(startDate, i);
-                const predictedCost = avgDailyCost * (1 + (Math.random() * 0.1 - 0.05)); // Add 5% variance
-                cumulativeCost += predictedCost;
-                
-                dailyForecasts.push({
-                    date: forecastDate.toISOString(),
-                    predictedCost,
-                    confidenceLower: predictedCost * 0.90, // 90% confidence interval
-                    confidenceUpper: predictedCost * 1.10,
-                    currency: historicalData.currency
-                });
-            }
-
-            const forecastedData: ForecastedCostData = {
-                forecastStartDate: startDate.toISOString(),
-                forecastEndDate: endDate.toISOString(),
-                totalForecastedCost: cumulativeCost,
-                currency: historicalData.currency,
-                dailyForecasts,
-                monthlyForecasts: [], // Could aggregate daily into monthly
-                forecastMethod: 'linear-projection',
-                confidenceLevel: 0.90,
-                assumptions: [
-                    'Based on 30-day historical average',
-                    'Assumes similar usage patterns',
-                    'Does not account for planned changes or seasonality'
-                ]
-            };
-
-            logInfo(`Forecasted cost for next ${days} days: ${forecastedData.totalForecastedCost} ${forecastedData.currency}`);
-            return forecastedData;
-            
-        } catch (error) {
-            logError(`Error generating cost forecast: ${error}`);
-            throw error;
-        }
+    public async getForecastedCostData(days = 30, existing?: HistoricalCostData): Promise<ForecastedCostData> {
+        if (!Number.isInteger(days) || days < 1 || days > 365) throw new Error('Forecast days must be an integer from 1 to 365.');
+        const history = existing || await this.getHistoricalCostData(30), start = midnight(this.now());
+        return { forecastStartDate: new Date(start).toISOString(), forecastEndDate: new Date(start + days * DAY - 1).toISOString(),
+            totalForecastedCost: null, currency: history.currency, dailyForecasts: [], monthlyForecasts: [], forecastMethod: 'unavailable', confidenceLevel: null,
+            assumptions: ['No validated forecast is collected. No random projection or confidence interval is generated.'] };
     }
 
-    /**
-     * Query actual costs from Azure Cost Management API
-     */
-    private async queryActualCosts(startDate: Date, endDate: Date): Promise<{
-        totalCost: number;
-        currency: string;
-        dailyCosts: CostDataPoint[];
-        dailyServiceCosts: DailyServiceCostPoint[];
-        monthlyCosts: CostDataPoint[];
-        costByResource: CostByResource[];
-        costByService: CostByService[];
-        costByResourceGroup: Array<{ resourceGroup: string; cost: number; resourceCount: number }>;
-    }> {
-        // Check cache first
-        const cacheKey = this.getCacheKey(startDate, endDate, 'costs');
-        const cachedResult = this.getCachedResult(cacheKey);
-        if (cachedResult) {
-            return cachedResult;
-        }
-
-        try {
-            logInfo(`Querying actual costs from ${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')}...`);
-            
-            // Query 1: Get daily costs
-            const dailyQuery = {
-                type: "Usage",
-                timeframe: "Custom",
-                timePeriod: {
-                    from: startDate.toISOString(),
-                    to: endDate.toISOString()
-                },
-                dataset: {
-                    granularity: "Daily",
-                    aggregation: {
-                        totalCost: {
-                            name: "Cost",
-                            function: "Sum"
-                        }
-                    }
-                }
-            };
-
-            // Query 2: Get costs by service
-            const serviceQuery = {
-                type: "Usage",
-                timeframe: "Custom",
-                timePeriod: {
-                    from: startDate.toISOString(),
-                    to: endDate.toISOString()
-                },
-                dataset: {
-                    granularity: "None",
-                    aggregation: {
-                        totalCost: {
-                            name: "Cost",
-                            function: "Sum"
-                        }
-                    },
-                    grouping: [
-                        {
-                            type: "Dimension",
-                            name: "ServiceName"
-                        }
-                    ]
-                }
-            };
-
-            // Query 3: Get daily costs by service to attribute daily fluctuations
-            const dailyServiceQuery = {
-                type: "Usage",
-                timeframe: "Custom",
-                timePeriod: {
-                    from: startDate.toISOString(),
-                    to: endDate.toISOString()
-                },
-                dataset: {
-                    granularity: "Daily",
-                    aggregation: {
-                        totalCost: {
-                            name: "Cost",
-                            function: "Sum"
-                        }
-                    },
-                    grouping: [
-                        {
-                            type: "Dimension",
-                            name: "ServiceName"
-                        }
-                    ]
-                }
-            };
-
-            // Execute queries sequentially with delay and retry logic to avoid rate limiting
-            const dailyResult = await this.executeWithRetry(
-                () => this.client.query.usage(this.scope, dailyQuery as any),
-                'daily costs query'
-            );
-            await this.delay(this.API_DELAY_MS);
-            
-            const serviceResult = await this.executeWithRetry(
-                () => this.client.query.usage(this.scope, serviceQuery as any),
-                'service costs query'
-            );
-            await this.delay(this.API_DELAY_MS);
-
-            const dailyServiceResult = await this.executeWithRetry(
-                () => this.client.query.usage(this.scope, dailyServiceQuery as any),
-                'daily service costs query'
-            );
-
-            // Parse daily costs
-            const dailyCosts: CostDataPoint[] = [];
-            let totalCost = 0;
-            
-            if (dailyResult.rows && dailyResult.rows.length > 0) {
-                const costIndex = dailyResult.columns?.findIndex((col: any) => col.name === 'Cost') ?? -1;
-                const dateIndex = dailyResult.columns?.findIndex((col: any) => col.name === 'UsageDate') ?? -1;
-                const currencyIndex = dailyResult.columns?.findIndex((col: any) => col.name === 'Currency') ?? -1;
-
-                dailyResult.rows.forEach((row: any) => {
-                    const cost = costIndex >= 0 ? parseFloat(row[costIndex]) : 0;
-                    const date = dateIndex >= 0 ? row[dateIndex] : '';
-                    const currency = currencyIndex >= 0 ? row[currencyIndex] : 'USD';
-                    
-                    totalCost += cost;
-                    
-                    // Parse the date correctly - Azure returns it in YYYYMMDD format as a number
-                    let dateString: string;
-                    if (typeof date === 'number') {
-                        // Convert YYYYMMDD number to Date object
-                        const dateStr = date.toString();
-                        const year = parseInt(dateStr.substring(0, 4));
-                        const month = parseInt(dateStr.substring(4, 6)) - 1; // JS months are 0-indexed
-                        const day = parseInt(dateStr.substring(6, 8));
-                        dateString = new Date(year, month, day).toISOString();
-                    } else if (typeof date === 'string' && date.length === 8) {
-                        // Handle string format YYYYMMDD
-                        const year = parseInt(date.substring(0, 4));
-                        const month = parseInt(date.substring(4, 6)) - 1;
-                        const day = parseInt(date.substring(6, 8));
-                        dateString = new Date(year, month, day).toISOString();
-                    } else {
-                        dateString = date;
-                    }
-                    
-                    dailyCosts.push({
-                        date: dateString,
-                        cost,
-                        currency
-                    });
-                });
-            }
-
-            // Parse service costs
-            const costByService: CostByService[] = [];
-            const serviceMap = new Map<string, number>();
-            const dailyServiceCosts: DailyServiceCostPoint[] = [];
-            
-            if (serviceResult.rows && serviceResult.rows.length > 0) {
-                const costIndex = serviceResult.columns?.findIndex((col: any) => col.name === 'Cost') ?? -1;
-                const serviceIndex = serviceResult.columns?.findIndex((col: any) => col.name === 'ServiceName') ?? -1;
-
-                serviceResult.rows.forEach((row: any) => {
-                    const cost = costIndex >= 0 ? parseFloat(row[costIndex]) : 0;
-                    const serviceName = serviceIndex >= 0 ? row[serviceIndex] : 'Unknown';
-                    
-                    if (serviceName && cost > 0) {
-                        const existing = serviceMap.get(serviceName) || 0;
-                        serviceMap.set(serviceName, existing + cost);
-                    }
-                });
-
-                // Convert map to array and calculate percentages
-                const totalServiceCost = Array.from(serviceMap.values()).reduce((sum, cost) => sum + cost, 0);
-                
-                serviceMap.forEach((cost, serviceName) => {
-                    const category = this.categorizeService(serviceName);
-                    costByService.push({
-                        serviceName,
-                        serviceCategory: category,
-                        cost,
-                        currency: 'USD',
-                        percentageOfTotal: totalServiceCost > 0 ? (cost / totalServiceCost) * 100 : 0
-                    });
-                });
-
-                // Sort by cost descending
-                costByService.sort((a, b) => b.cost - a.cost);
-            }
-
-            // Parse daily service costs
-            if (dailyServiceResult.rows && dailyServiceResult.rows.length > 0) {
-                const costIndex = dailyServiceResult.columns?.findIndex((col: any) => col.name === 'Cost') ?? -1;
-                const dateIndex = dailyServiceResult.columns?.findIndex((col: any) => col.name === 'UsageDate') ?? -1;
-                const currencyIndex = dailyServiceResult.columns?.findIndex((col: any) => col.name === 'Currency') ?? -1;
-                const serviceIndex = dailyServiceResult.columns?.findIndex((col: any) => col.name === 'ServiceName') ?? -1;
-
-                dailyServiceResult.rows.forEach((row: any) => {
-                    const cost = costIndex >= 0 ? parseFloat(row[costIndex]) : 0;
-                    const date = dateIndex >= 0 ? row[dateIndex] : '';
-                    const currency = currencyIndex >= 0 ? row[currencyIndex] : 'USD';
-                    const serviceName = serviceIndex >= 0 ? row[serviceIndex] : 'Unknown';
-
-                    if (!serviceName || cost <= 0) {
-                        return;
-                    }
-
-                    let dateString: string;
-                    if (typeof date === 'number') {
-                        const dateStr = date.toString();
-                        const year = parseInt(dateStr.substring(0, 4));
-                        const month = parseInt(dateStr.substring(4, 6)) - 1;
-                        const day = parseInt(dateStr.substring(6, 8));
-                        dateString = new Date(year, month, day).toISOString();
-                    } else if (typeof date === 'string' && date.length === 8) {
-                        const year = parseInt(date.substring(0, 4));
-                        const month = parseInt(date.substring(4, 6)) - 1;
-                        const day = parseInt(date.substring(6, 8));
-                        dateString = new Date(year, month, day).toISOString();
-                    } else {
-                        dateString = date;
-                    }
-
-                    dailyServiceCosts.push({
-                        date: dateString,
-                        serviceName,
-                        serviceCategory: this.categorizeService(serviceName),
-                        cost,
-                        currency
-                    });
-                });
-            }
-
-            logInfo(`Query complete: ${totalCost.toFixed(2)} USD across ${dailyCosts.length} days, ${costByService.length} services, ${dailyServiceCosts.length} daily service points`);
-
-            const result = {
-                totalCost,
-                currency: 'USD',
-                dailyCosts,
-                dailyServiceCosts,
-                monthlyCosts: [],
-                costByResource: [],
-                costByService,
-                costByResourceGroup: []
-            };
-
-            // Cache the result
-            this.setCachedResult(cacheKey, result);
-
-            return result;
-            
-        } catch (error) {
-            logError(`Error querying actual costs: ${error}`);
-            if (this.LIVE_DATA_ONLY) {
-                const errorText = String(error);
-                const wrongIssuerDetected = errorText.includes('wrong issuer') && errorText.includes('must match the tenant');
-                if (wrongIssuerDetected) {
-                    throw new Error(
-                        'Live cost query failed due to Azure tenant token mismatch. ' +
-                        'Run `az account clear`, then `az login --tenant <AZURE_TENANT_ID>`, and ensure the active subscription belongs to that tenant. ' +
-                        'Fallback is disabled (AZURE_COST_LIVE_DATA_ONLY=true).'
-                    );
-                }
-
-                throw new Error(
-                    `Live cost query failed and fallback is disabled (AZURE_COST_LIVE_DATA_ONLY=true). ` +
-                    `Please retry later or increase AZURE_COST_API_DELAY_MS / AZURE_COST_MAX_RETRIES.`
-                );
-            }
-
-            logWarning('Falling back to mock data due to API error');
-            return this.generateMockCostData(startDate, endDate);
-        }
+    public async getComprehensiveCostAnalysis(): Promise<ComprehensiveCostAnalysis> {
+        if (this.reportDate) throw new Error('A report is already being collected by this service.');
+        this.reportDate = this.clock();
+        try { return await this.collectAnalysis(); }
+        finally { this.reportDate = undefined; this.queryCache.clear(); }
     }
 
-    /**
-     * Categorize Azure service into a logical category
-     */
-    private categorizeService(serviceName: string): string {
-        const name = serviceName.toLowerCase();
-        
-        if (name.includes('virtual machine') || name.includes('compute') || name.includes('kubernetes') || 
-            name.includes('container') || name.includes('functions') || name.includes('app service')) {
-            return 'Compute';
+    private async collectAnalysis(): Promise<ComprehensiveCostAnalysis> {
+        this.queryCache.clear(); this.collectedPages = 0;
+        const now = this.now(), settings = configService.getAnalysisConfig();
+        const historical = await this.getHistoricalCostData(settings.historicalDays), current = await this.getCurrentCostData();
+        if (historical.currency !== current.currency) throw new Error('Currency differs between report periods.');
+        const forecasted = await this.getForecastedCostData(settings.forecastDays, historical), distinctDays = new Map<string, CostDataPoint>();
+        for (const day of [...historical.dailyCosts, ...current.dailyCosts]) {
+            const existing = distinctDays.get(day.date);
+            if (existing && Math.abs(existing.cost - day.cost) > 0.01) throw new Error('Overlapping period costs changed during collection. Retry.');
+            distinctDays.set(day.date, day);
         }
-        if (name.includes('storage') || name.includes('blob') || name.includes('file') || 
-            name.includes('disk') || name.includes('backup')) {
-            return 'Storage';
-        }
-        if (name.includes('sql') || name.includes('database') || name.includes('cosmos') || 
-            name.includes('redis') || name.includes('cache')) {
-            return 'Databases';
-        }
-        if (name.includes('network') || name.includes('gateway') || name.includes('load balancer') || 
-            name.includes('firewall') || name.includes('vpn') || name.includes('dns')) {
-            return 'Networking';
-        }
-        if (name.includes('monitor') || name.includes('log') || name.includes('insight') || 
-            name.includes('alert') || name.includes('metric')) {
-            return 'Management';
-        }
-        if (name.includes('ai') || name.includes('cognitive') || name.includes('bot') || 
-            name.includes('machine learning')) {
-            return 'AI + ML';
-        }
-        if (name.includes('security') || name.includes('key vault') || name.includes('sentinel')) {
-            return 'Security';
-        }
-        
-        return 'Other';
-    }
-
-    /**
-     * Generate mock data as fallback
-     */
-    private generateMockCostData(startDate: Date, endDate: Date): {
-        totalCost: number;
-        currency: string;
-        dailyCosts: CostDataPoint[];
-        dailyServiceCosts: DailyServiceCostPoint[];
-        monthlyCosts: CostDataPoint[];
-        costByResource: CostByResource[];
-        costByService: CostByService[];
-        costByResourceGroup: Array<{ resourceGroup: string; cost: number; resourceCount: number }>;
-    } {
-        const days = Math.floor((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
-        const dailyCosts: CostDataPoint[] = [];
-        const dailyServiceCosts: DailyServiceCostPoint[] = [];
-        let totalCost = 0;
-        
-        for (let i = 0; i <= days; i++) {
-            const date = addDays(startDate, i);
-            const cost = 100 + Math.random() * 50;
-            totalCost += cost;
-            
-            dailyCosts.push({
-                date: format(date, 'yyyy-MM-dd'),
-                cost,
-                currency: 'USD'
-            });
-
-            const computeShare = cost * 0.45;
-            const storageShare = cost * 0.25;
-            const databaseShare = cost * 0.20;
-            const otherShare = cost * 0.10;
-
-            dailyServiceCosts.push(
-                {
-                    date: format(date, 'yyyy-MM-dd'),
-                    serviceName: 'Virtual Machines',
-                    serviceCategory: 'Compute',
-                    cost: computeShare,
-                    currency: 'USD'
-                },
-                {
-                    date: format(date, 'yyyy-MM-dd'),
-                    serviceName: 'Storage Accounts',
-                    serviceCategory: 'Storage',
-                    cost: storageShare,
-                    currency: 'USD'
-                },
-                {
-                    date: format(date, 'yyyy-MM-dd'),
-                    serviceName: 'Azure SQL Database',
-                    serviceCategory: 'Databases',
-                    cost: databaseShare,
-                    currency: 'USD'
-                },
-                {
-                    date: format(date, 'yyyy-MM-dd'),
-                    serviceName: 'Log Analytics',
-                    serviceCategory: 'Management',
-                    cost: otherShare,
-                    currency: 'USD'
-                }
-            );
-        }
-
-        // Mock service distribution
-        const serviceDistribution = [
-            { name: 'Virtual Machines', category: 'Compute', percentage: 35 },
-            { name: 'Azure Kubernetes Service', category: 'Compute', percentage: 20 },
-            { name: 'Azure SQL Database', category: 'Databases', percentage: 15 },
-            { name: 'Storage Accounts', category: 'Storage', percentage: 8 },
-            { name: 'Application Gateway', category: 'Networking', percentage: 7 },
-            { name: 'Azure Cosmos DB', category: 'Databases', percentage: 5 },
-            { name: 'Log Analytics', category: 'Management', percentage: 4 },
-            { name: 'Azure Functions', category: 'Compute', percentage: 3 },
-            { name: 'Azure Cache for Redis', category: 'Databases', percentage: 2 },
-            { name: 'Azure Monitor', category: 'Management', percentage: 1 }
-        ];
-
-        const costByService: CostByService[] = serviceDistribution.map(service => ({
-            serviceName: service.name,
-            serviceCategory: service.category,
-            cost: totalCost * (service.percentage / 100),
-            currency: 'USD',
-            percentageOfTotal: service.percentage
-        }));
-
-        return {
-            totalCost,
-            currency: 'USD',
-            dailyCosts,
-            dailyServiceCosts,
-            monthlyCosts: [],
-            costByResource: [],
-            costByService,
-            costByResourceGroup: []
-        };
-    }
-
-    /**
-     * Calculate summary metrics from all cost data
-     */
-    private calculateSummary(
-        historical: HistoricalCostData,
-        current: CurrentCostData,
-        forecasted: ForecastedCostData
-    ) {
-        const allDailyCosts = [...historical.dailyCosts, ...current.dailyCosts];
-        const costs = allDailyCosts.map(d => d.cost);
-        
-        return {
-            totalHistoricalCost: historical.totalCost,
-            currentMonthToDate: current.monthToDateCost,
-            forecastedMonthEnd: current.estimatedMonthEndCost,
-            forecastedNextMonth: forecasted.totalForecastedCost,
-            currency: historical.currency,
-            avgDailySpend: costs.reduce((a, b) => a + b, 0) / costs.length,
-            peakDailySpend: Math.max(...costs),
-            lowestDailySpend: Math.min(...costs)
-        };
+        const costs = [...distinctDays.values()].map(d => d.cost);
+        return { id: `analysis-${now.getTime()}`, subscriptionId: this.subscriptionId, scope: this.scope, analysisDate: now.toISOString(), historical, current, forecasted,
+            trends: [], anomalies: [], fluctuations: [], dataProvenance: { mode: 'live', source: 'Azure Cost Management Query API', generatedFromFallback: false,
+                queryPolicy: this.policy, costBasis: 'ActualCost', coverage: 'Single selected subscription; tenant-wide coverage not assessed',
+                queriedThrough: new Date(midnight(now) - 1).toISOString(), collectedPages: this.collectedPages, notices: [
+                    'All requested pages collected; daily, service and resource totals reconciled within 0.01 currency units.',
+                    'Today is excluded (UTC). Costs remain provisional: billing ingestion lag and rerating are not measured.',
+                    'Missing daily rows are not imputed as zero. Averages use observed days; calendar completeness is not guaranteed.',
+                    'Forecasts, utilization-based recommendations and savings estimates are unavailable in this report.',
+                    'ActualCost is not a reconciled invoice and includes signed adjustments returned by Azure.'
+                ] }, summary: { totalHistoricalCost: historical.totalCost, currentMonthToDate: current.monthToDateCost, forecastedMonthEnd: null, forecastedNextMonth: null,
+                    currency: historical.currency, avgDailySpend: sumCosts(costs) / costs.length, peakDailySpend: Math.max(...costs), lowestDailySpend: Math.min(...costs) } };
     }
 }

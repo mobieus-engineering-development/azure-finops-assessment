@@ -90,7 +90,8 @@ export function getTrendColor(direction: string): chalk.Chalk {
  * Helper function to colorize percentage changes
  * Negative percentages (decreases) are good for costs
  */
-export function getChangeColor(changePercent: number): chalk.Chalk {
+export function getChangeColor(changePercent: number | null): chalk.Chalk {
+    if (changePercent === null) return colors.neutral;
     if (changePercent < -5) {
         return colors.positive;  // Significant decrease - good!
     } else if (changePercent > 5) {
@@ -103,14 +104,16 @@ export function getChangeColor(changePercent: number): chalk.Chalk {
 /**
  * Format currency with color
  */
-export function formatCurrency(amount: number, currency: string = 'USD'): string {
+export function formatCurrency(amount: number | null, currency: string = 'USD'): string {
+    if (amount === null || !Number.isFinite(amount)) return colors.dim('Unavailable');
     return `${colors.value(amount.toFixed(2))} ${colors.currency(currency)}`;
 }
 
 /**
  * Format percentage with appropriate color based on context (costs)
  */
-export function formatPercentChange(percent: number, isGoodWhenNegative: boolean = true): string {
+export function formatPercentChange(percent: number | null, isGoodWhenNegative: boolean = true): string {
+    if (percent === null || !Number.isFinite(percent)) return colors.dim('N/A (non-positive baseline)');
     const sign = percent > 0 ? '+' : '';
     const formatted = `${sign}${percent.toFixed(1)}%`;
     

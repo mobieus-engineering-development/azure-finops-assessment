@@ -7,15 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Changed — trustworthy numbers
 
-- Custom report templates
-- Email notification integration
-- Webhook support for alerts
-- Cost allocation tag analysis
-- Resource group cost breakdown
-- Custom time range selection
-- Export to CSV/Excel formats
+- Read-only ActualCost reporting with complete pagination, signed costs, currency validation, resource/group breakdowns and reconciled totals.
+- UTC completed-day periods, comparable elapsed-day changes, distinct-day averages and explicit coverage/freshness limitations.
+- Removed synthetic fallback, random forecasts and heuristic savings collectors from the active application. Unavailable values are nullable rather than invented.
+- Runtime subscription selection takes precedence over `.env`; required output failures now fail the run.
+- Added deterministic financial-integrity regression tests. Tenant aggregation, partial reporting and evidence-backed opportunities remain future work.
 
 ## [1.0.0] - 2025-11-12
 

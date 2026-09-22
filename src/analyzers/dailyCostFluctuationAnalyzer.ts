@@ -11,6 +11,7 @@ import {
 } from '../models/costAnalysis';
 import { configService } from '../utils/config';
 import { logInfo } from '../utils/logger';
+import { percentChange } from '../services/costQuery';
 
 export class DailyCostFluctuationAnalyzer {
     private readonly thresholdPercent: number;
@@ -36,12 +37,11 @@ export class DailyCostFluctuationAnalyzer {
         for (let i = 1; i < dailyCosts.length; i++) {
             const previousDay = dailyCosts[i - 1];
             const currentDay = dailyCosts[i];
+            if (Date.parse(currentDay.date) - Date.parse(previousDay.date) !== 86_400_000 || currentDay.currency !== previousDay.currency) continue;
             const totalChangeAmount = currentDay.cost - previousDay.cost;
-            const totalChangePercent = previousDay.cost > 0
-                ? (totalChangeAmount / previousDay.cost) * 100
-                : 0;
+            const totalChangePercent = percentChange(previousDay.cost, currentDay.cost);
 
-            if (Math.abs(totalChangePercent) < this.thresholdPercent) {
+            if (Math.abs(totalChangeAmount) < 0.01 || (totalChangePercent !== null && Math.abs(totalChangePercent) < this.thresholdPercent)) {
                 continue;
             }
 
@@ -59,8 +59,8 @@ export class DailyCostFluctuationAnalyzer {
                 previousTotalCost: previousDay.cost,
                 totalChangeAmount,
                 totalChangePercent,
-                direction: this.getDirection(totalChangePercent),
-                significance: this.getSignificance(totalChangePercent),
+                direction: totalChangeAmount > 0 ? 'increasing' : 'decreasing',
+                significance: totalChangePercent === null ? 'low' : this.getSignificance(totalChangePercent),
                 topServiceDrivers: serviceDeltas.slice(0, this.maxDrivers)
             });
         }
@@ -80,7 +80,8 @@ export class DailyCostFluctuationAnalyzer {
             if (!byDate.has(point.date)) {
                 byDate.set(point.date, new Map<string, DailyServiceCostPoint>());
             }
-            byDate.get(point.date)!.set(point.serviceName, point);
+            const prior = byDate.get(point.date)!.get(point.serviceName);
+            byDate.get(point.date)!.set(point.serviceName, { ...point, cost: (prior?.cost || 0) + point.cost });
         }
 
         return byDate;
@@ -92,6 +93,7 @@ export class DailyCostFluctuationAnalyzer {
         dailyServiceMap: Map<string, Map<string, DailyServiceCostPoint>>,
         currency: string
     ): ServiceCostDelta[] {
+        if (!dailyServiceMap.has(previousDate) || !dailyServiceMap.has(currentDate)) return [];
         const previous = dailyServiceMap.get(previousDate) || new Map<string, DailyServiceCostPoint>();
         const current = dailyServiceMap.get(currentDate) || new Map<string, DailyServiceCostPoint>();
 
@@ -107,9 +109,7 @@ export class DailyCostFluctuationAnalyzer {
                 return;
             }
 
-            const changePercent = previousCost > 0
-                ? (changeAmount / previousCost) * 100
-                : (currentCost > 0 ? 100 : 0);
+            const changePercent = percentChange(previousCost, currentCost);
 
             deltas.push({
                 serviceName,

@@ -11,7 +11,7 @@ interface TrendInsight {
     type: 'moving_average' | 'week_over_week' | 'seasonality' | 'projection';
     description: string;
     value: number;
-    confidence: 'low' | 'medium' | 'high';
+    confidence?: 'low' | 'medium' | 'high';
 }
 
 export class CostTrendAnalyzer {
@@ -22,6 +22,10 @@ export class CostTrendAnalyzer {
         logInfo('Analyzing cost trends...');
         
         const trends: CostTrend[] = [];
+        const daily = analysis.historical.dailyCosts;
+        if (daily.some((point, i) => i > 0 && (Date.parse(point.date) - Date.parse(daily[i - 1].date) !== 86_400_000 || point.currency !== daily[i - 1].currency))) {
+            return []; // Do not label sparse observations as continuous-day trends.
+        }
         
         // Analyze daily trends with enhanced insights
         const dailyTrend = this.analyzePeriodTrend(
@@ -39,11 +43,8 @@ export class CostTrendAnalyzer {
         if (weeklyTrend) trends.push(weeklyTrend);
         
         // Analyze monthly trends
-        const monthlyTrend = this.analyzePeriodTrend(
-            analysis.historical.monthlyCosts,
-            'monthly'
-        );
-        if (monthlyTrend) trends.push(monthlyTrend);
+        // Rolling lookbacks contain partial months. Use the explicit closed-month
+        // comparison in CurrentCostData rather than compare those partial totals.
         
         logInfo(`Identified ${trends.length} cost trends with advanced analytics`);
         return trends;
@@ -60,6 +61,7 @@ export class CostTrendAnalyzer {
 
         const costs = dataPoints.map(d => d.cost);
         const firstCost = costs[0];
+        if (firstCost <= 0) return null;
         const lastCost = costs[costs.length - 1];
         const changeAmount = lastCost - firstCost;
         const changePercent = firstCost > 0 ? (changeAmount / firstCost) * 100 : 0;
@@ -80,8 +82,7 @@ export class CostTrendAnalyzer {
             changePercent,
             changeAmount,
             dataPoints,
-            movingAverages: this.calculateMovingAverageValues(dataPoints),
-            projectedNextPeriod: this.projectNextPeriod(dataPoints)
+            movingAverages: this.calculateMovingAverageValues(dataPoints)
         };
     }
 
@@ -95,9 +96,8 @@ export class CostTrendAnalyzer {
             const sevenDayAvg = this.calculateSimpleMovingAverage(dataPoints, 7);
             insights.push({
                 type: 'moving_average',
-                description: `7-day moving average: $${sevenDayAvg.toFixed(2)}/day`,
-                value: sevenDayAvg,
-                confidence: 'high'
+                description: `7-day moving average: ${sevenDayAvg.toFixed(2)} ${dataPoints[0].currency}/day`,
+                value: sevenDayAvg
             });
         }
         
@@ -105,9 +105,8 @@ export class CostTrendAnalyzer {
             const thirtyDayAvg = this.calculateSimpleMovingAverage(dataPoints, 30);
             insights.push({
                 type: 'moving_average',
-                description: `30-day moving average: $${thirtyDayAvg.toFixed(2)}/day`,
-                value: thirtyDayAvg,
-                confidence: 'high'
+                description: `30-day moving average: ${thirtyDayAvg.toFixed(2)} ${dataPoints[0].currency}/day`,
+                value: thirtyDayAvg
             });
         }
         
@@ -157,6 +156,7 @@ export class CostTrendAnalyzer {
         
         const lastWeekTotal = lastWeek.reduce((sum, d) => sum + d.cost, 0);
         const previousWeekTotal = previousWeek.reduce((sum, d) => sum + d.cost, 0);
+        if (previousWeekTotal <= 0) return null;
         
         const changeAmount = lastWeekTotal - previousWeekTotal;
         const changePercent = previousWeekTotal > 0 ? (changeAmount / previousWeekTotal) * 100 : 0;
